@@ -1,0 +1,106 @@
+name: Phase A CC Map Type Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-maptype-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-map-type:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Prepare trusted binary and analysis tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/tools audit/input audit/extracted audit/output
+          (
+            cd audit/GoReSym
+            test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+            go build -trimpath -o ../tools/goresym .
+          )
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/node.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/node.zip' | md5sum -c -
+          unzip -q audit/input/node.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Resolve FixedMap runtime type
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # nodes.init 中两个 FixedMap 分配点都使用同一运行时类型地址 0x2ecd580。
+          # 直接让 GoReSym 递归解析该 RTYPE，确认其实际泛型实例。
+          audit/tools/goresym -m 0x2ecd580 "${BIN}" > audit/output/fixedmap-rtype.txt 2>&1 || true
+
+          # 同时输出所有含 ccBlockedCounter / FixedMap 的类型，便于交叉验证。
+          audit/tools/goresym -t -human "${BIN}" > audit/all-types.txt 2>&1
+          grep -Ei -C 5 'ccBlockedCounter|FixedMap' audit/all-types.txt > audit/output/cc-fixedmap-types.txt || true
+          rm -f audit/all-types.txt
+
+      - name: Map initialization PCs back to source lines
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # 0x1786deb: 写入容量 0x8000 前后的第一个 FixedMap 初始化；
+          # 0x1786f4b: 写入容量 0x20000 前后的第二个 FixedMap 初始化；
+          # 0x173a85c: increaseCCCounter 读取 ccBlockedCounter 全局 map。
+          printf '0x1786deb\n0x1786f4b\n0x173a85c\n' | go tool addr2line "${BIN}" \
+            > audit/output/target-source-lines.txt 2>&1 || true
+
+          # 额外把所有 nodes.init.N 的入口映射回源码，寻找与 http_request_cc 对应的 init 函数。
+          audit/tools/goresym -d "${BIN}" > audit/goresym.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('audit/goresym.json').read_text())
+          funcs=list(data.get('UserFunctions') or [])+list(data.get('StdFunctions') or [])
+          rows=[]
+          for f in funcs:
+              name=f.get('FullName') or ''
+              if not name.startswith('github.com/TeaOSLab/EdgeNode/internal/nodes.init'):
+                  continue
+              s=f.get('Start',0)
+              s=int(s,0) if isinstance(s,str) else int(s or 0)
+              rows.append((s,name))
+          rows.sort()
+          Path('audit/init-addresses.txt').write_text(''.join(f'0x{s:x}\n' for s,_ in rows))
+          Path('audit/output/init-function-names.txt').write_text(''.join(f'0x{s:x}\t{name}\n' for s,name in rows))
+          PY
+          go tool addr2line "${BIN}" < audit/init-addresses.txt > audit/output/init-source-lines.txt 2>&1 || true
+          rm -f audit/goresym.json audit/init-addresses.txt
+
+      - name: Upload map type audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-maptype-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
