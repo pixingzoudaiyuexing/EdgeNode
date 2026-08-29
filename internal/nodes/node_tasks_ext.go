@@ -10,15 +10,8 @@ func (this *Node) execScriptsChangedTask() error {
 	return nil
 }
 
-func (this *Node) execUAMPolicyChangedTask(rpcClient *rpc.RPCClient) error {
-	// stub
-	return nil
-}
-
-func (this *Node) execHTTPCCPolicyChangedTask(rpcClient *rpc.RPCClient) error {
-	// stub
-	return nil
-}
+// UAM 与 HTTP CC 的任务刷新已迁移到无 build tag 的自维护实现，
+// 普通构建和后续自维护 plus 构建共用同一条安全策略刷新链。
 
 func (this *Node) execHTTPPagesPolicyChangedTask(rpcClient *rpc.RPCClient) error {
 	// stub
