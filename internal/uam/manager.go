@@ -179,7 +179,7 @@ func (m *Manager) CheckPrevKey(writer http.ResponseWriter, req *http.Request, re
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_, err = writer.Write([]byte(`{"ok":true}`))
+	_, err = writer.Write([]byte("{\"ok\":true}"))
 	return err
 }
 
