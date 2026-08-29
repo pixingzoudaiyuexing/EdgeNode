@@ -34,9 +34,9 @@ type CheckOptions struct {
 
 // PageOptions 是浏览器挑战页面的可配置文本。
 type PageOptions struct {
-	Title              string
-	Body               string
-	IncludeSubdomains  bool
+	Title             string
+	Body              string
+	IncludeSubdomains bool
 }
 
 // Manager 实现与 1.3.9 Plus 外部协议兼容的 UAM Key 和浏览器挑战。
@@ -177,8 +177,10 @@ func (m *Manager) CheckPrevKey(writer http.ResponseWriter, req *http.Request, re
 	}
 	http.SetCookie(writer, finalCookie)
 	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	return nil
+	_, err = writer.Write([]byte(`{"ok":true}`))
+	return err
 }
 
 // LoadPage 下发第一阶段 ge_ua_p 并输出浏览器 JavaScript 挑战页面。
