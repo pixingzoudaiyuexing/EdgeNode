@@ -15,8 +15,9 @@ func TestRequestTrackerRollingWindows(t *testing.T) {
 	tracker.Record("ip-a", base.Add(4*time.Second))
 	tracker.Record("ip-a", base.Add(9*time.Second))
 
-	if count := tracker.Count("ip-a", base.Add(9*time.Second), 5); count != 2 {
-		t.Fatalf("最近 5 秒应有 2 次请求，实际 %d", count)
+	// 以 t=9s 为当前秒时，最近 5 个整秒桶是 5,6,7,8,9；t=4s 已离开窗口。
+	if count := tracker.Count("ip-a", base.Add(9*time.Second), 5); count != 1 {
+		t.Fatalf("最近 5 秒应有 1 次请求，实际 %d", count)
 	}
 	if count := tracker.Count("ip-a", base.Add(9*time.Second), 10); count != 4 {
 		t.Fatalf("最近 10 秒应有 4 次请求，实际 %d", count)
