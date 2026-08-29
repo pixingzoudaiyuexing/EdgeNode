@@ -52,7 +52,7 @@ func TestCheckPrevKeyReturnsCompatibleJSONAndFinalCookie(t *testing.T) {
 	if contentType := result.Header.Get("Content-Type"); contentType != "application/json; charset=utf-8" {
 		t.Fatalf("unexpected content type: %q", contentType)
 	}
-	if body := recorder.Body.String(); body != `{"ok":true}` {
+	if body := recorder.Body.String(); body != "{\"ok\":true}" {
 		t.Fatalf("unexpected body: %q", body)
 	}
 
