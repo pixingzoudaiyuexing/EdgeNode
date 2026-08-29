@@ -46,8 +46,19 @@ func RedirectCounterKey(serverId int64, remoteAddr string, durationSeconds int) 
 	return counterPrefix + ":redirect:" + strconv.FormatInt(serverId, 10) + ":" + strconv.Itoa(durationSeconds) + ":" + remoteAddr
 }
 
+// ThresholdReached 判断一次已经完成 IncreaseKey() 的请求是否达到 CC 阈值。
+//
+// 可信 1.3.9 Plus doCC() 反汇编已经确认原版比较关系：
+// 当当前计数 count >= MaxRequests 时立即触发。因此 MaxRequests=30 时，
+// 第 30 次请求就进入 CC 动作，不需要等到第 31 次。
+func ThresholdReached(count uint32, maxRequests int32) bool {
+	if maxRequests <= 0 {
+		return false
+	}
+	return uint64(count) >= uint64(maxRequests)
+}
+
 // IncreaseThreshold 使用 1.3.9 原生时间分片 Counter 记录一次阈值请求。
-// 本函数只返回当前统计值，不解释 MaxRequests 的触发边界。
 func IncreaseThreshold(serverId int64, clientKey string, requestPath string, withRequestPath bool, periodSeconds int) uint32 {
 	if serverId <= 0 || clientKey == "" || periodSeconds <= 0 {
 		return 0
@@ -83,9 +94,6 @@ func IncreaseQPS(serverId int64, remoteAddr string) uint32 {
 }
 
 // IncreaseRedirect 记录一次 CC GET302 重定向行为。
-//
-// 这里只累计 HTTPCCPolicy.RedirectsChecking.DurationSeconds 时间窗内的次数，
-// 不解释 MaxRedirects 的触发边界，也不负责封禁，避免在原版比较语义未确认前猜测。
 func IncreaseRedirect(serverId int64, remoteAddr string, durationSeconds int) uint32 {
 	if serverId <= 0 || remoteAddr == "" || durationSeconds <= 0 {
 		return 0
