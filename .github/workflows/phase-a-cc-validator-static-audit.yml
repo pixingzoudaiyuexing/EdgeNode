@@ -1,0 +1,172 @@
+name: Phase A CC Validator Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-validator-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-validator:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Build pinned GoReSym
+        working-directory: audit/GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+          mkdir -p ../tools
+          go build -trimpath -o ../tools/goresym .
+
+      - name: Download and verify trusted 1.3.9 Plus archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Recover doCC referenced strings with GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          audit/tools/goresym -d -p -strings "${BIN}" > audit/goresym-strings.json
+          objdump -d -M intel --start-address=0x17387e0 --stop-address=0x173a4a0 "${BIN}" \
+            > audit/doCC-objdump.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          data = json.loads(Path('audit/goresym-strings.json').read_text())
+          entries = []
+          for item in data.get('Strings') or []:
+              start = item.get('Start', 0)
+              if isinstance(start, str):
+                  start = int(start, 0)
+              text = item.get('Str') or ''
+              entries.append((int(start), text))
+          entries.sort()
+
+          asm = Path('audit/doCC-objdump.txt').read_text(errors='replace')
+          refs = sorted({int(x, 16) for x in re.findall(r'#\s+0x([0-9a-f]+)', asm, re.I)})
+
+          out = []
+          for addr in refs:
+              matches = []
+              for start, text in entries:
+                  raw_len = len(text.encode('utf-8', errors='ignore'))
+                  if start <= addr < start + max(raw_len, 1):
+                      matches.append((start, text))
+              if matches:
+                  for start, text in matches:
+                      safe = text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                      out.append(f'0x{addr:x}\t0x{start:x}\t{safe}\n')
+
+          Path('audit/output/doCC-referenced-strings.txt').write_text(''.join(out))
+
+          focus = []
+          needles = ('cc', 'validator', 'redirect', 'key', 'finger', 'global', 'request', 'block')
+          for start, text in entries:
+              low = text.lower()
+              if any(n in low for n in needles) and len(text) <= 300:
+                  safe = text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                  focus.append(f'0x{start:x}\t{safe}\n')
+          Path('audit/output/focused-go-strings.txt').write_text(''.join(focus))
+          PY
+
+          rm -f audit/goresym-strings.json audit/doCC-objdump.txt
+
+      - name: Locate original escalation FixedMap initialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # increaseCCCounter() 可信反汇编中使用的全局 FixedMap 指针地址为 0x52f3198。
+          # 全量反汇编只在管道中流过，artifact 仅保存命中地址附近上下文。
+          objdump -d -M intel "${BIN}" | \
+            grep -B 16 -A 20 -E '# 0x52f3198([[:space:]]|$)' \
+            > audit/output/escalation-map-xrefs.txt || true
+
+          # 同时把 NewFixedMap 相关 Go 函数名和地址筛出来，便于映射初始化调用。
+          audit/tools/goresym -d "${BIN}" > audit/goresym-functions.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('audit/goresym-functions.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+          out = []
+          for fn in funcs:
+              name = fn.get('FullName') or ''
+              if 'FixedMap' not in name and 'init' not in name.lower():
+                  continue
+              start = fn.get('Start', 0)
+              end = fn.get('End', 0)
+              def n(v):
+                  return int(v, 0) if isinstance(v, str) else int(v or 0)
+              out.append((n(start), n(end), name))
+          out.sort()
+          Path('audit/output/fixedmap-init-functions.txt').write_text(
+              ''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in out)
+          )
+          PY
+          rm -f audit/goresym-functions.json
+
+      - name: Build validator audit summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# GoEdge 1.3.9 Plus CC Validator 静态审计'
+            echo
+            echo '- ZIP MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
+            echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
+            echo '- 原版 edge-node 未执行。'
+            echo
+            echo '## doCC 引用字符串映射'
+            cat audit/output/doCC-referenced-strings.txt 2>/dev/null || true
+            echo
+            echo '## escalation FixedMap 全局引用'
+            cat audit/output/escalation-map-xrefs.txt 2>/dev/null || true
+          } > audit/output/summary.md
+
+      - name: Upload validator static audit text
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-validator-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
