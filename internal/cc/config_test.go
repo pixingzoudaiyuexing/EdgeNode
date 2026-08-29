@@ -17,7 +17,7 @@ func TestResolveConfigWithPolicyThresholds(t *testing.T) {
 	site := &serverconfigs.HTTPCCConfig{
 		IsOn:                 true,
 		UseDefaultThresholds: true,
-		Action:                "",
+		Action:                "custom-action",
 	}
 	policy := &nodeconfigs.HTTPCCPolicy{Thresholds: policyThresholds}
 
@@ -28,8 +28,8 @@ func TestResolveConfigWithPolicyThresholds(t *testing.T) {
 	if !reflect.DeepEqual(resolved.Thresholds, policyThresholds) {
 		t.Fatalf("unexpected thresholds: %#v", resolved.Thresholds)
 	}
-	if resolved.Action != serverconfigs.DefaultHTTPCCConfig.Action {
-		t.Fatalf("unexpected action: %q", resolved.Action)
+	if resolved.Action != site.Action {
+		t.Fatalf("action should be preserved: %q", resolved.Action)
 	}
 
 	// 必须是独立副本，运行时修改不能污染策略对象。
@@ -118,6 +118,9 @@ func TestResolveConfigDoesNotMutateSite(t *testing.T) {
 	}
 	if site.Action != "" {
 		t.Fatalf("site action should remain unchanged: %q", site.Action)
+	}
+	if resolved.Action != "" {
+		t.Fatalf("unknown empty action should stay empty: %q", resolved.Action)
 	}
 	if site.Thresholds[0] != originalThresholds[0] {
 		t.Fatal("site thresholds should remain untouched")
