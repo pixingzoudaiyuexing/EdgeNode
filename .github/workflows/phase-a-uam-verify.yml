@@ -49,12 +49,10 @@ jobs:
           # 这些文件只存在于 Actions 工作目录，不提交到产品源码。
           # 目的仅是绕过尚未重建、且与本轮 UAM 无关的旧 Plus 空桩，
           # 让编译器继续检查 UAM 请求链接线本身。
+          # 高级 CC 已有正式的 http_request_cc_plus.go，不再生成 CC CI 空桩。
           sed 's#//go:build !plus#//go:build plus#' \
             internal/utils/minifiers/minify.go \
             > internal/utils/minifiers/minify_ci_plus.go
-          sed 's#//go:build !plus#//go:build plus#' \
-            internal/nodes/http_request_cc.go \
-            > internal/nodes/http_request_cc_ci_plus.go
 
           # LN / Plan / HLS / OSS / sendfile / listener / node task / TOA 等仍是
           # 历史 Plus 私有缺口。这里只复制现有 community 空桩给 plus 类型检查使用，
@@ -127,7 +125,6 @@ jobs:
 
           gofmt -w \
             internal/utils/minifiers/minify_ci_plus.go \
-            internal/nodes/http_request_cc_ci_plus.go \
             internal/nodes/http_request_ln_ci_plus.go \
             internal/nodes/http_request_plan_before_ci_plus.go \
             internal/nodes/http_request_hls_ci_plus.go \
