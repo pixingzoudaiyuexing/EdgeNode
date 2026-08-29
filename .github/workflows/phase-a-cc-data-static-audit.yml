@@ -1,0 +1,104 @@
+name: Phase A CC Data Static Audit
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/phase-a-cc-data-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare trusted 1.3.9 Plus binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/node.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/node.zip' | md5sum -c -
+          unzip -q audit/input/node.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "$BIN"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  $BIN" | md5sum -c -
+          echo "$BIN" > audit/output/binary-path.txt
+          readelf -W -S "$BIN" > audit/output/sections.txt
+          readelf -W -l "$BIN" > audit/output/program-headers.txt
+
+      - name: Read CC FixedMap global and pointed object directly from ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          python3 - "$BIN" <<'PY'
+          import re, struct, subprocess, sys
+          from pathlib import Path
+
+          binary=Path(sys.argv[1])
+          data=binary.read_bytes()
+          sec_text=subprocess.check_output(['readelf','-W','-S',str(binary)], text=True)
+          sections=[]
+          # [Nr] Name Type Address Off Size ES Flg Lk Inf Al
+          rx=re.compile(r'^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+')
+          for line in sec_text.splitlines():
+              m=rx.match(line)
+              if not m: continue
+              name=m.group(1); va=int(m.group(2),16); off=int(m.group(3),16); size=int(m.group(4),16)
+              sections.append((name,va,off,size))
+
+          def locate(va, size=1):
+              for name,sva,off,ssize in sections:
+                  if sva <= va and va+size <= sva+ssize and off+ssize <= len(data):
+                      return name, off+(va-sva)
+              return None
+
+          def read(va,size):
+              loc=locate(va,size)
+              if loc is None: return None,None
+              name,off=loc
+              return name,data[off:off+size]
+
+          GLOBAL=0x52f3198
+          out=[]
+          name,raw=read(GLOBAL,8)
+          out.append(f'global=0x{GLOBAL:x} section={name} raw={raw.hex() if raw else None}\n')
+          if raw:
+              ptr=struct.unpack('<Q',raw)[0]
+              out.append(f'global_pointer=0x{ptr:x}\n')
+              if ptr:
+                  obj_sec,obj=read(ptr,96)
+                  out.append(f'object_section={obj_sec} object_bytes={obj.hex() if obj else None}\n')
+                  if obj and len(obj)>=40:
+                      # FixedMap layout in 1.3.9 public source:
+                      # m ptr @0; keys slice @8..31; maxSize int @32.
+                      mptr=struct.unpack_from('<Q',obj,0)[0]
+                      keys_data,keys_len,keys_cap=struct.unpack_from('<QQQ',obj,8)
+                      max_size=struct.unpack_from('<q',obj,32)[0]
+                      out.append(f'm=0x{mptr:x}\nkeys_data=0x{keys_data:x}\nkeys_len={keys_len}\nkeys_cap={keys_cap}\nmax_size={max_size}\n')
+          Path('audit/output/cc-fixedmap-data.txt').write_text(''.join(out))
+
+          # 同时把全局变量前后 0x40 的原始字节保存为文本，便于判断静态相邻对象/指针。
+          base=GLOBAL-0x40
+          sec,blob=read(base,0x80)
+          Path('audit/output/cc-global-neighborhood.txt').write_text(
+              f'base=0x{base:x} section={sec}\n'+
+              (blob.hex()+'\n' if blob else '<not file backed>\n')
+          )
+          PY
+
+          cat audit/output/cc-fixedmap-data.txt
+
+      - name: Upload CC data audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-data-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
