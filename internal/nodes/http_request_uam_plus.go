@@ -11,12 +11,15 @@ import (
 	"time"
 
 	"github.com/TeaOSLab/EdgeCommon/pkg/nodeconfigs"
+	"github.com/TeaOSLab/EdgeCommon/pkg/serverconfigs/firewallconfigs"
 	"github.com/TeaOSLab/EdgeNode/internal/iplibrary"
 	"github.com/TeaOSLab/EdgeNode/internal/remotelogs"
 	"github.com/TeaOSLab/EdgeNode/internal/uam"
-	"github.com/TeaOSLab/EdgeNode/internal/utils/ttlcache"
+	"github.com/TeaOSLab/EdgeNode/internal/waf"
 	wafutils "github.com/TeaOSLab/EdgeNode/internal/waf/utils"
 )
+
+const uamWhiteListIPType = "uam"
 
 var sharedUAMQPSTracker = uam.NewQPSTracker()
 
@@ -54,7 +57,8 @@ func (this *HTTPRequest) doUAM() (block bool) {
 
 	config := this.web.UAM
 
-	// 已经通过当前节点 UAM 校验并被临时记忆的 IP，仅跳过 UAM，不跳过 WAF。
+	// 通过 5 秒盾后按网站配置加入节点临时 IP 白名单。
+	// 这里只使用独立的 uam 类型，所以仅跳过 UAM，不会把该 IP 变成 WAF 全局白名单。
 	if this.isUAMTemporarilyAllowed(remoteAddr) {
 		return false
 	}
@@ -195,25 +199,32 @@ func (this *HTTPRequest) uamQPSKey(remoteAddr string) string {
 	return strconv.FormatInt(serverId, 10) + "@" + remoteAddr
 }
 
-func (this *HTTPRequest) uamAllowedKey(remoteAddr string) string {
-	return "uam:allowed:" + this.uamQPSKey(remoteAddr)
-}
-
 func (this *HTTPRequest) isUAMTemporarilyAllowed(remoteAddr string) bool {
-	if remoteAddr == "" {
+	if remoteAddr == "" || this == nil || this.ReqServer == nil {
 		return false
 	}
-	return ttlcache.SharedInt64Cache.Read(this.uamAllowedKey(remoteAddr)) != nil
+	return waf.SharedIPWhiteList.Contains(
+		uamWhiteListIPType,
+		firewallconfigs.FirewallScopeServer,
+		this.ReqServer.Id,
+		remoteAddr,
+	)
 }
 
 func (this *HTTPRequest) rememberUAMAllowedIP(remoteAddr string, keyLife int) {
-	if remoteAddr == "" {
+	if remoteAddr == "" || this == nil || this.ReqServer == nil {
 		return
 	}
 	if keyLife <= 0 {
 		keyLife = 3600
 	}
-	ttlcache.SharedInt64Cache.Write(this.uamAllowedKey(remoteAddr), 1, time.Now().Unix()+int64(keyLife))
+	waf.SharedIPWhiteList.Add(
+		uamWhiteListIPType,
+		firewallconfigs.FirewallScopeServer,
+		this.ReqServer.Id,
+		remoteAddr,
+		time.Now().Unix()+int64(keyLife),
+	)
 }
 
 func (this *HTTPRequest) writeUAMResult(ok bool) {
