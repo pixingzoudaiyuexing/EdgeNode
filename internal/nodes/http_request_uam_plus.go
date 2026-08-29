@@ -43,8 +43,7 @@ func (this *HTTPRequest) doUAM() (block bool) {
 	remoteAddr := this.requestRemoteAddr(true)
 	policy := this.findUAMPolicy()
 
-	// Challenge POST 必须被当前请求直接消费，不能在失败后继续进入源站。
-	// 即使策略刚好在页面展示后被动态关闭，也仍然完成/拒绝这次协议回调。
+	// Challenge POST 由当前请求直接消费，且在 WAF 之前处理，避免协议自身被 WAF 拦截。
 	if this.isUAMRequest() {
 		return this.doUAMChallenge(remoteAddr, policy)
 	}
@@ -80,7 +79,7 @@ func (this *HTTPRequest) doUAM() (block bool) {
 		return false
 	}
 	if policy.DenySpiders && spiderRegexp.MatchString(userAgent) {
-		this.writeCode(http.StatusForbidden, "Spider is not allowed.", "当前客户端不允许访问")
+		this.sendUAMPlainResponse(http.StatusForbidden, "Spider is not allowed.\n")
 		return true
 	}
 
@@ -91,7 +90,7 @@ func (this *HTTPRequest) doUAM() (block bool) {
 	manager, err := this.newUAMManager()
 	if err != nil {
 		remotelogs.Error("UAM", "initialize UAM manager failed: "+err.Error())
-		this.writeCode(http.StatusInternalServerError, "Failed to initialize UAM.", "5秒盾初始化失败")
+		this.sendUAMPlainResponse(http.StatusInternalServerError, "Failed to initialize UAM.\n")
 		return true
 	}
 
@@ -108,8 +107,8 @@ func (this *HTTPRequest) doUAM() (block bool) {
 		Body:              policy.UIBody,
 		IncludeSubdomains: policy.IncludeSubdomains,
 	}); err != nil {
+		// LoadPage 可能已经写出响应头，因此这里只记录错误，避免二次写状态码破坏响应。
 		remotelogs.Error("UAM", "load UAM page failed: "+err.Error())
-		this.writeCode(http.StatusInternalServerError, "Failed to load UAM page.", "5秒盾页面加载失败")
 	}
 	return true
 }
@@ -229,4 +228,13 @@ func (this *HTTPRequest) writeUAMResult(ok bool) {
 	} else {
 		_, _ = this.writer.Write([]byte("{\"ok\":false}"))
 	}
+}
+
+func (this *HTTPRequest) sendUAMPlainResponse(status int, body string) {
+	if this == nil || this.writer == nil {
+		return
+	}
+	this.writer.Header().Set("Cache-Control", "no-cache")
+	this.writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	this.writer.Send(status, body)
 }
