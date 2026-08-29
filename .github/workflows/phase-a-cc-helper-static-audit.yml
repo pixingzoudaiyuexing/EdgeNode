@@ -1,0 +1,203 @@
+name: Phase A CC Helper Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-helper-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-cc-helpers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Build pinned GoReSym
+        working-directory: audit/GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+          mkdir -p ../tools
+          go build -trimpath -o ../tools/goresym .
+
+      - name: Download and verify trusted 1.3.9 Plus archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+          sha256sum audit/input/edge-node-linux-amd64-plus-v1.3.9.zip > audit/output/archive-sha256.txt
+          sha256sum "${BIN}" > audit/output/binary-sha256.txt
+
+      - name: Recover exact helper ranges with GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # 仅运行静态分析工具，原版 edge-node 只作为输入文件被读取，从不执行。
+          audit/tools/goresym -d -p "${BIN}" > audit/goresym-full.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('audit/goresym-full.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+
+          def to_int(value):
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str):
+                  return int(value, 0)
+              return int(value or 0)
+
+          rows = []
+          for fn in funcs:
+              rows.append((
+                  to_int(fn.get('Start')),
+                  to_int(fn.get('End')),
+                  fn.get('FullName') or '',
+              ))
+          rows.sort()
+
+          targets = {
+              'increaseCCCounter': 'github.com/TeaOSLab/EdgeNode/internal/nodes.(*HTTPRequest).increaseCCCounter',
+              'checkCCRedirects': 'github.com/TeaOSLab/EdgeNode/internal/nodes.(*HTTPRequest).checkCCRedirects',
+          }
+
+          for short, full in targets.items():
+              exact = [row for row in rows if row[2] == full]
+              if len(exact) != 1:
+                  raise SystemExit(f'{short} 未唯一定位: {exact!r}')
+              start, end, name = exact[0]
+              Path(f'audit/output/{short}-range.txt').write_text(
+                  f'FUNC\t0x{start:x}\t0x{end:x}\t{name}\n'
+              )
+              idx = rows.index(exact[0])
+              nearby = rows[max(0, idx-3):idx+4]
+              Path(f'audit/output/{short}-neighborhood.txt').write_text(
+                  ''.join(f'FUNC\t0x{s:x}\t0x{e:x}\t{n}\n' for s, e, n in nearby)
+              )
+
+          Path('audit/functions.tsv').write_text(
+              ''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in rows)
+          )
+          PY
+
+          rm -f audit/goresym-full.json
+
+      - name: Disassemble helper functions and map direct calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          for FN in increaseCCCounter checkCCRedirects; do
+            START="$(awk -F '\t' '{print $2; exit}' "audit/output/${FN}-range.txt")"
+            END="$(awk -F '\t' '{print $3; exit}' "audit/output/${FN}-range.txt")"
+            objdump -d -M intel --start-address="${START}" --stop-address="${END}" "${BIN}" \
+              > "audit/output/${FN}-objdump.txt"
+            grep -E '(^|[[:space:]])(cmp|test|j[a-z]+|call|imul|mul|add|sub|shl|shr)[[:space:]]' \
+              "audit/output/${FN}-objdump.txt" \
+              > "audit/output/${FN}-control-flow.txt" || true
+          done
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          funcs = {}
+          for line in Path('audit/functions.tsv').read_text().splitlines():
+              start, end, name = line.split('\t', 2)
+              funcs[int(start, 16)] = (int(end, 16), name)
+
+          call_re = re.compile(r'^\s*([0-9a-f]+):.*?\bcall\s+([0-9a-fx]+)', re.I)
+          for fn in ('increaseCCCounter', 'checkCCRedirects'):
+              text = Path(f'audit/output/{fn}-objdump.txt').read_text(errors='replace')
+              out = []
+              for line in text.splitlines():
+                  m = call_re.search(line)
+                  if not m:
+                      continue
+                  insn = int(m.group(1), 16)
+                  raw = m.group(2)
+                  target = int(raw, 0 if raw.lower().startswith('0x') else 16)
+                  name = funcs.get(target, (0, '<未映射直接调用>'))[1]
+                  out.append(f'0x{insn:x}\t0x{target:x}\t{name}\n')
+              Path(f'audit/output/{fn}-calls.txt').write_text(''.join(out))
+          PY
+
+          rm -f audit/functions.tsv
+
+      - name: Collect focused CC strings
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          strings -a -n 5 "${BIN}" | \
+            grep -Ei -C 3 'CC|VALIDATOR|redirect|too many|request|block|blacklist|counter|fingerprint' \
+            > audit/output/helper-strings.txt || true
+
+      - name: Build helper audit summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# GoEdge 1.3.9 Plus CC Helper 静态审计'
+            echo
+            echo '- ZIP MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
+            echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
+            echo '- GoReSym: 6fba10d77df98335cbd1fb7839043d1ffde8defb'
+            echo '- 原版 edge-node 未执行。'
+            echo
+            echo '## increaseCCCounter 范围'
+            cat audit/output/increaseCCCounter-range.txt
+            echo
+            echo '## increaseCCCounter 直接调用'
+            cat audit/output/increaseCCCounter-calls.txt
+            echo
+            echo '## checkCCRedirects 范围'
+            cat audit/output/checkCCRedirects-range.txt
+            echo
+            echo '## checkCCRedirects 直接调用'
+            cat audit/output/checkCCRedirects-calls.txt
+          } > audit/output/summary.md
+
+      - name: Upload helper static audit text
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-helper-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
