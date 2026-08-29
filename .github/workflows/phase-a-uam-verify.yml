@@ -113,4 +113,20 @@ jobs:
 
       - name: Type-check UAM request chain with plus tag
         working-directory: EdgeNode
-        run: go test -run '^$' -tags plus ./internal/nodes
+        shell: bash
+        run: |
+          set +e
+          go test -run '^$' -tags plus ./internal/nodes 2>&1 | tee uam-plus-typecheck.log
+          status=${PIPESTATUS[0]}
+          echo "${status}" > uam-plus-typecheck.status
+          exit "${status}"
+
+      - name: Upload UAM Plus type-check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uam-plus-typecheck-log
+          path: |
+            EdgeNode/uam-plus-typecheck.log
+            EdgeNode/uam-plus-typecheck.status
+          if-no-files-found: error
