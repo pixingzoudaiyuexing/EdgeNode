@@ -40,7 +40,7 @@ type PageOptions struct {
 }
 
 // Manager 实现与 1.3.9 Plus 外部协议兼容的 UAM Key 和浏览器挑战。
-// 加密材料由节点自身的 NodeId/Secret 提供，不依赖任何外部授权或官方服务。
+// 加密材料由调用方从节点/集群本地配置派生，不依赖任何外部授权或官方服务。
 type Manager struct {
 	method encrypt.MethodInterface
 }
@@ -241,9 +241,10 @@ func (m *Manager) LoadPage(writer http.ResponseWriter, req *http.Request, remote
     }
     return '';
   }
+  function retry(){ window.setTimeout(function(){location.reload();},1000); }
   function run(){
     var value=cookieValue(cpk);
-    if(!value){ window.setTimeout(function(){location.reload();},1000); return; }
+    if(!value){ retry(); return; }
     var sum=0;
     for(var i=0;i<value.length;i++){
       var c=value.charAt(i);
@@ -254,14 +255,18 @@ func (m *Manager) LoadPage(writer http.ResponseWriter, req *http.Request, remote
     xhr.setRequestHeader('Content-type','application/x-www-form-urlencoded');
     xhr.setRequestHeader('X-GE-UA-Step',step);
     xhr.onreadystatechange=function(){
-      if(xhr.readyState===4 && xhr.status===200){
-        var left=5;
-        window.setInterval(function(){
-          var el=document.getElementById('counter'); if(el) el.textContent=left; if(left>0) left--;
-        },1000);
-        window.setTimeout(function(){location.reload();},5000);
-      }
+      if(xhr.readyState!==4) return;
+      if(xhr.status!==200){ retry(); return; }
+      var response=null;
+      try{ response=JSON.parse(xhr.responseText||'{}'); }catch(e){ retry(); return; }
+      if(!response || response.ok!==true){ retry(); return; }
+      var left=5;
+      window.setInterval(function(){
+        var el=document.getElementById('counter'); if(el) el.textContent=left; if(left>0) left--;
+      },1000);
+      window.setTimeout(function(){location.reload();},5000);
     };
+    xhr.onerror=retry;
     xhr.send('sum='+encodeURIComponent(sum)+'&nonce='+encodeURIComponent(nonce));
   }
   if(window.addEventListener) window.addEventListener('load',run); else window.onload=run;
