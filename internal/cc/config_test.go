@@ -69,20 +69,15 @@ func TestResolveConfigWithCustomThresholds(t *testing.T) {
 	}
 }
 
-func TestResolveConfigDefaultThresholdFallback(t *testing.T) {
+func TestResolveConfigKeepsThresholdsEmptyWhenDefaultPolicyMissing(t *testing.T) {
 	for _, policy := range []*nodeconfigs.HTTPCCPolicy{
 		nil,
 		{},
 	} {
 		site := &serverconfigs.HTTPCCConfig{UseDefaultThresholds: true}
 		resolved := ResolveConfig(site, policy)
-		if !reflect.DeepEqual(resolved.Thresholds, serverconfigs.DefaultHTTPCCThresholds) {
-			t.Fatalf("should fallback to default thresholds: %#v", resolved.Thresholds)
-		}
-
-		resolved.Thresholds[0].MaxRequests = 999
-		if serverconfigs.DefaultHTTPCCThresholds[0].MaxRequests == 999 {
-			t.Fatal("fallback thresholds should be cloned")
+		if len(resolved.Thresholds) != 0 {
+			t.Fatalf("缺少明确集群阈值时不应启用候选默认值: %#v", resolved.Thresholds)
 		}
 	}
 }
@@ -124,6 +119,9 @@ func TestResolveConfigDoesNotMutateSite(t *testing.T) {
 	}
 	if site.Thresholds[0] != originalThresholds[0] {
 		t.Fatal("site thresholds should remain untouched")
+	}
+	if len(resolved.Thresholds) != 0 {
+		t.Fatalf("空集群策略不应激活网站中的候选默认阈值: %#v", resolved.Thresholds)
 	}
 }
 
