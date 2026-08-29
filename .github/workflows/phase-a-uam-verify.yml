@@ -35,6 +35,10 @@ jobs:
           go-version: "1.21.x"
           cache-dependency-path: EdgeNode/go.sum
 
+      - name: UAM policy tests
+        working-directory: EdgeCommon
+        run: go test ./pkg/nodeconfigs -run '^TestUAMPolicyFirewallScope$'
+
       - name: UAM unit tests
         working-directory: EdgeNode
         run: go test ./internal/uam
