@@ -103,3 +103,28 @@ func TestCheckPrevKeyRejectsWrongSum(t *testing.T) {
 		t.Fatal("wrong challenge sum should be rejected")
 	}
 }
+
+func TestLoadPageRequiresSuccessfulJSONResult(t *testing.T) {
+	manager, err := NewManager("test-node-id", "test-node-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://www.example.com/path", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 UAM-Test")
+	recorder := httptest.NewRecorder()
+	if err := manager.LoadPage(recorder, req, "203.0.113.12", PageOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := recorder.Body.String()
+	for _, expected := range []string{
+		"JSON.parse(xhr.responseText||'{}')",
+		"response.ok!==true",
+		"xhr.onerror=retry",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("challenge page should contain %q", expected)
+		}
+	}
+}
