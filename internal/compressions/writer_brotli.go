@@ -1,5 +1,4 @@
 // Copyright 2021 GoEdge goedge.cdn@gmail.com. All rights reserved.
-//go:build !plus || !linux
 
 package compressions
 
@@ -8,6 +7,8 @@ import (
 	"io"
 )
 
+// BrotliWriter 使用公开的纯 Go Brotli 实现。
+// 自维护版本在 Linux + plus 构建下也使用该实现，保持原有 Writer/Pool 接口并移除对私有 C-Brotli 的依赖。
 type BrotliWriter struct {
 	BaseWriter
 

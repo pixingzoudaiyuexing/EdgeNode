@@ -1,5 +1,4 @@
 // Copyright 2021 GoEdge goedge.cdn@gmail.com. All rights reserved.
-//go:build !plus || !linux
 
 package compressions
 
@@ -9,6 +8,8 @@ import (
 	"strings"
 )
 
+// BrotliReader 使用公开的纯 Go Brotli 实现。
+// 自维护版本在 Linux + plus 构建下也使用该实现，避免依赖原 Plus 私有的 C-Brotli 代码和额外系统库。
 type BrotliReader struct {
 	BaseReader
 
