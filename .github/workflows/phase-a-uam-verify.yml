@@ -52,6 +52,39 @@ jobs:
             internal/nodes/http_request_cc.go \
             > internal/nodes/http_request_cc_ci_plus.go
 
+          # EdgeCommon 的 OSSConfig 在公开源码中已有 !plus 空实现；
+          # CI 中只复制为 plus 版本，避免把尚未恢复的 OSS 私有实现混入 UAM 工作。
+          sed 's#//go:build !plus#//go:build plus#; s#// +build !plus#// +build plus#' \
+            ../EdgeCommon/pkg/serverconfigs/ossconfigs/oss_config.go \
+            > ../EdgeCommon/pkg/serverconfigs/ossconfigs/oss_config_ci_plus.go
+
+          # HTTPAuthPolicy.Init() 的公开实现被 !plus 标签排除；CI 只复制同一实现。
+          sed 's#//go:build !plus#//go:build plus#' \
+            ../EdgeCommon/pkg/serverconfigs/http_auth_policy_init.go \
+            > ../EdgeCommon/pkg/serverconfigs/http_auth_policy_init_ci_plus.go
+
+          # HTTPAuthType 文件在当前恢复仓库中缺失。这里按同代公开 EdgeCommon
+          # 的原始定义补最小类型，仅用于让编译器继续走到 UAM 请求链。
+          cat > ../EdgeCommon/pkg/serverconfigs/http_auth_type_ci_plus.go <<'EOF'
+          //go:build plus
+
+          package serverconfigs
+
+          type HTTPAuthType = string
+
+          const (
+              HTTPAuthTypeBasicAuth  HTTPAuthType = "basicAuth"
+              HTTPAuthTypeSubRequest HTTPAuthType = "subRequest"
+          )
+          EOF
+
+          gofmt -w \
+            internal/utils/minifiers/minify_ci_plus.go \
+            internal/nodes/http_request_cc_ci_plus.go \
+            ../EdgeCommon/pkg/serverconfigs/ossconfigs/oss_config_ci_plus.go \
+            ../EdgeCommon/pkg/serverconfigs/http_auth_policy_init_ci_plus.go \
+            ../EdgeCommon/pkg/serverconfigs/http_auth_type_ci_plus.go
+
       - name: Type-check UAM request chain with plus tag
         working-directory: EdgeNode
         run: go test -run '^$' -tags plus ./internal/nodes
