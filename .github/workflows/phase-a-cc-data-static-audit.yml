@@ -44,13 +44,11 @@ jobs:
           data=binary.read_bytes()
           sec_text=subprocess.check_output(['readelf','-W','-S',str(binary)], text=True)
           sections=[]
-          # [Nr] Name Type Address Off Size ES Flg Lk Inf Al
           rx=re.compile(r'^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+')
           for line in sec_text.splitlines():
               m=rx.match(line)
               if not m: continue
-              name=m.group(1); va=int(m.group(2),16); off=int(m.group(3),16); size=int(m.group(4),16)
-              sections.append((name,va,off,size))
+              sections.append((m.group(1),int(m.group(2),16),int(m.group(3),16),int(m.group(4),16)))
 
           def locate(va, size=1):
               for name,sva,off,ssize in sections:
@@ -75,24 +73,38 @@ jobs:
                   obj_sec,obj=read(ptr,96)
                   out.append(f'object_section={obj_sec} object_bytes={obj.hex() if obj else None}\n')
                   if obj and len(obj)>=40:
-                      # FixedMap layout in 1.3.9 public source:
-                      # m ptr @0; keys slice @8..31; maxSize int @32.
                       mptr=struct.unpack_from('<Q',obj,0)[0]
                       keys_data,keys_len,keys_cap=struct.unpack_from('<QQQ',obj,8)
                       max_size=struct.unpack_from('<q',obj,32)[0]
                       out.append(f'm=0x{mptr:x}\nkeys_data=0x{keys_data:x}\nkeys_len={keys_len}\nkeys_cap={keys_cap}\nmax_size={max_size}\n')
           Path('audit/output/cc-fixedmap-data.txt').write_text(''.join(out))
 
-          # 同时把全局变量前后 0x40 的原始字节保存为文本，便于判断静态相邻对象/指针。
           base=GLOBAL-0x40
           sec,blob=read(base,0x80)
           Path('audit/output/cc-global-neighborhood.txt').write_text(
               f'base=0x{base:x} section={sec}\n'+
               (blob.hex()+'\n' if blob else '<not file backed>\n')
           )
+
+          # 这些地址和长度来自可信原版 doCC() 的 concatstring3/concatstring5
+          # 调用参数，直接读取 ELF 中的只读字符串，恢复原版 RecordIP reason。
+          targets=[
+              ('conn_prefix',0x30f0d02,0x26),
+              ('conn_suffix',0x3090aff,3),
+              ('threshold_prefix',0x30c03fd,0x14),
+              ('threshold_middle',0x30bb358,0x12),
+              ('threshold_suffix',0x3090b08,3),
+          ]
+          lines=[]
+          for label,va,size in targets:
+              sec,raw=read(va,size)
+              text=raw.decode('utf-8','replace') if raw else ''
+              lines.append(f'{label}\t0x{va:x}\t{size}\t{sec}\t{text!r}\t{raw.hex() if raw else None}\n')
+          Path('audit/output/cc-block-reason-strings.tsv').write_text(''.join(lines))
           PY
 
           cat audit/output/cc-fixedmap-data.txt
+          cat audit/output/cc-block-reason-strings.tsv
 
       - name: Upload CC data audit
         if: always()
