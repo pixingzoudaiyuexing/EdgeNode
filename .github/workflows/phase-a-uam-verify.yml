@@ -52,14 +52,18 @@ jobs:
             internal/nodes/http_request_cc.go \
             > internal/nodes/http_request_cc_ci_plus.go
 
-          # LN / Plan / HLS / OSS / sendfile 等仍是历史 Plus 私有缺口。
-          # 这里只复制现有 community 空桩给 plus 类型检查使用，不改变产品代码。
+          # LN / Plan / HLS / OSS / sendfile / listener / node task / TOA 等仍是
+          # 历史 Plus 私有缺口。这里只复制现有 community 空桩给 plus 类型检查使用，
+          # 不改变这些功能的产品实现。
           for source in \
             http_request_ln.go \
             http_request_plan_before.go \
             http_request_hls.go \
             http_request_oss.go \
-            http_writer_ext.go
+            http_writer_ext.go \
+            listener_base_ext.go \
+            node_tasks_ext.go \
+            toa_manager.go
           do
             target="internal/nodes/${source%.go}_ci_plus.go"
             sed 's#//go:build !plus#//go:build plus#; s#// +build !plus#// +build plus#' \
@@ -125,6 +129,9 @@ jobs:
             internal/nodes/http_request_hls_ci_plus.go \
             internal/nodes/http_request_oss_ci_plus.go \
             internal/nodes/http_writer_ext_ci_plus.go \
+            internal/nodes/listener_base_ext_ci_plus.go \
+            internal/nodes/node_tasks_ext_ci_plus.go \
+            internal/nodes/toa_manager_ci_plus.go \
             ../EdgeCommon/pkg/serverconfigs/ossconfigs/oss_config_ci_plus.go \
             ../EdgeCommon/pkg/serverconfigs/http_auth_policy_init_ci_plus.go \
             ../EdgeCommon/pkg/serverconfigs/http_auth_type_ci_plus.go \
