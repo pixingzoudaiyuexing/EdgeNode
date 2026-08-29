@@ -1,0 +1,130 @@
+name: Phase A CC Init Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-init-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-init:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Build GoReSym and verify original binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/tools audit/input audit/extracted audit/output
+          (
+            cd audit/GoReSym
+            test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+            go build -trimpath -o ../tools/goresym .
+          )
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Recover nodes init functions and FixedMap functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          audit/tools/goresym -d "${BIN}" > audit/goresym.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('audit/goresym.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+          def n(v):
+              return int(v,0) if isinstance(v,str) else int(v or 0)
+          rows=[]
+          for f in funcs:
+              rows.append((n(f.get('Start')), n(f.get('End')), f.get('FullName') or ''))
+          rows.sort()
+          Path('audit/functions.tsv').write_text(''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s,e,name in rows))
+          focus=[]
+          for s,e,name in rows:
+              low=name.lower()
+              if ('internal/nodes.init' in low or 'fixedmap' in low or 'ccblockedcounter' in low):
+                  focus.append((s,e,name))
+          Path('audit/output/init-fixedmap-functions.txt').write_text(''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s,e,name in focus))
+          exact=[r for r in rows if r[2]=='github.com/TeaOSLab/EdgeNode/internal/nodes.init']
+          if len(exact)!=1:
+              raise SystemExit(f'nodes.init not unique: {exact!r}')
+          s,e,name=exact[0]
+          Path('audit/output/nodes-init-range.txt').write_text(f'0x{s:x}\t0x{e:x}\t{name}\n')
+          PY
+          rm -f audit/goresym.json
+
+      - name: Disassemble nodes init and map calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          START="$(awk -F '\t' '{print $1; exit}' audit/output/nodes-init-range.txt)"
+          END="$(awk -F '\t' '{print $2; exit}' audit/output/nodes-init-range.txt)"
+          objdump -d -M intel --start-address="${START}" --stop-address="${END}" "${BIN}" > audit/output/nodes-init-objdump.txt
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          funcs={}
+          for line in Path('audit/functions.tsv').read_text().splitlines():
+              s,e,name=line.split('\t',2)
+              funcs[int(s,16)]=(int(e,16),name)
+          asm=Path('audit/output/nodes-init-objdump.txt').read_text(errors='replace')
+          call_re=re.compile(r'^\s*([0-9a-f]+):.*?\bcall\s+([0-9a-fx]+)',re.I)
+          out=[]
+          for line in asm.splitlines():
+              m=call_re.search(line)
+              if not m: continue
+              insn=int(m.group(1),16)
+              raw=m.group(2)
+              target=int(raw,0 if raw.lower().startswith('0x') else 16)
+              name=funcs.get(target,(0,'<unmapped>'))[1]
+              out.append(f'0x{insn:x}\t0x{target:x}\t{name}\n')
+          Path('audit/output/nodes-init-calls.txt').write_text(''.join(out))
+          PY
+
+          grep -Ei -B 12 -A 20 'FixedMap|makemap|newobject|ccBlockedCounter' audit/output/nodes-init-calls.txt > audit/output/nodes-init-fixedmap-calls-context.txt || true
+          grep -n -E '0x52f3198|0x52f3190|0x52f31a0' audit/output/nodes-init-objdump.txt > audit/output/nodes-init-global-direct-refs.txt || true
+
+          # 额外保留所有小整数立即数附近上下文，方便识别 NewFixedMap(maxSize) 被内联后的容量赋值。
+          grep -n -B 4 -A 8 -E '\b(mov|cmp).*0x(64|c8|1f4|3e8|7d0|2710|186a0)\b' audit/output/nodes-init-objdump.txt > audit/output/nodes-init-capacity-candidates.txt || true
+          rm -f audit/functions.tsv
+
+      - name: Upload CC init static audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-init-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
