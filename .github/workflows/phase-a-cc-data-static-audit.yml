@@ -31,7 +31,7 @@ jobs:
           readelf -W -S "$BIN" > audit/output/sections.txt
           readelf -W -l "$BIN" > audit/output/program-headers.txt
 
-      - name: Read CC FixedMap global and pointed object directly from ELF
+      - name: Read CC FixedMap and original CC strings directly from ELF
         shell: bash
         run: |
           set -euo pipefail
@@ -86,25 +86,28 @@ jobs:
               (blob.hex()+'\n' if blob else '<not file backed>\n')
           )
 
-          # 这些地址和长度来自可信原版 doCC() 的 concatstring3/concatstring5
-          # 调用参数，直接读取 ELF 中的只读字符串，恢复原版 RecordIP reason。
+          # 地址和长度全部来自可信 1.3.9 Plus doCC() 的直接调用参数。
+          # 前五项恢复 RecordIP reason；最后两项恢复阈值触发时 writeCode(429)
+          # 的英文/中文提示文本。
           targets=[
               ('conn_prefix',0x30f0d02,0x26),
               ('conn_suffix',0x3090aff,3),
               ('threshold_prefix',0x30c03fd,0x14),
               ('threshold_middle',0x30bb358,0x12),
               ('threshold_suffix',0x3090b08,3),
+              ('threshold_429_en',0x310966f,0x31),
+              ('threshold_429_zh',0x310ca09,0x33),
           ]
           lines=[]
           for label,va,size in targets:
               sec,raw=read(va,size)
               text=raw.decode('utf-8','replace') if raw else ''
               lines.append(f'{label}\t0x{va:x}\t{size}\t{sec}\t{text!r}\t{raw.hex() if raw else None}\n')
-          Path('audit/output/cc-block-reason-strings.tsv').write_text(''.join(lines))
+          Path('audit/output/cc-original-strings.tsv').write_text(''.join(lines))
           PY
 
           cat audit/output/cc-fixedmap-data.txt
-          cat audit/output/cc-block-reason-strings.tsv
+          cat audit/output/cc-original-strings.tsv
 
       - name: Upload CC data audit
         if: always()
