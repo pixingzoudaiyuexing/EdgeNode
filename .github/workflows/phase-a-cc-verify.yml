@@ -115,7 +115,7 @@ jobs:
 
       - name: Plus CC request tests
         working-directory: EdgeNode
-        run: go test -tags plus ./internal/nodes -run '^(TestHTTPRequestDoCCObservesCustomThreshold|TestHTTPRequestDoCCSkipsCommonFileBeforeCounting)$'
+        run: go test -tags plus ./internal/nodes -run '^TestHTTPRequestDoCC'
 
       - name: Type-check Plus CC request chain
         working-directory: EdgeNode
