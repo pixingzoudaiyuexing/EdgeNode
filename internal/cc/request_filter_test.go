@@ -10,26 +10,26 @@ import (
 func TestMatchURL(t *testing.T) {
 	config := &serverconfigs.HTTPCCConfig{
 		OnlyURLPatterns: []*shared.URLPattern{
-			{Pattern: "/search*"},
+			{Type: shared.URLPatternTypeWildcard, Pattern: "/search*"},
 		},
 		ExceptURLPatterns: []*shared.URLPattern{
-			{Pattern: "/search/api*"},
+			{Type: shared.URLPatternTypeWildcard, Pattern: "/search/api*"},
 		},
 	}
 	if err := config.Init(); err != nil {
 		t.Fatal(err)
 	}
 
-	if !MatchURL(config, "/search?q=test") {
+	if !MatchURL(config, "https://example.com/search?q=test") {
 		t.Fatal("限制 URL 应进入 CC")
 	}
-	if MatchURL(config, "/search/api/list") {
+	if MatchURL(config, "https://example.com/search/api/list") {
 		t.Fatal("例外 URL 应跳过 CC")
 	}
-	if MatchURL(config, "/index") {
+	if MatchURL(config, "https://example.com/index") {
 		t.Fatal("不匹配限制 URL 的请求应跳过 CC")
 	}
-	if MatchURL(nil, "/search") {
+	if MatchURL(nil, "https://example.com/search") {
 		t.Fatal("nil 配置不应进入 CC")
 	}
 }
