@@ -22,6 +22,7 @@ import (
 const uamWhiteListIPType = "uam"
 
 var sharedUAMQPSTracker = uam.NewQPSTracker()
+var sharedUAMFailureTracker = uam.NewFailureTracker()
 
 // isUAMRequest 只识别 UAM 浏览器挑战的回调请求。
 // 正常页面请求仍然在 WAF 之后调用 doUAM；挑战 POST 则需要在 WAF 之前处理，
@@ -37,7 +38,6 @@ func (this *HTTPRequest) isUAMRequest() bool {
 }
 
 // doUAM 执行网站级 5 秒盾。
-// 当前阶段恢复请求触发、Key 校验和浏览器 Challenge；失败计数及防火墙封禁在 UAM-3 单独恢复。
 func (this *HTTPRequest) doUAM() (block bool) {
 	if this == nil || this.RawReq == nil || this.web == nil || this.web.UAM == nil || !this.web.UAM.IsOn {
 		return false
@@ -134,11 +134,52 @@ func (this *HTTPRequest) doUAMChallenge(remoteAddr string, policy *nodeconfigs.U
 		keyLife = this.web.UAM.KeyLife
 	}
 	if err = manager.CheckPrevKey(this.writer, this.RawReq, remoteAddr, this.uamCheckOptions(keyLife, policy)); err != nil {
+		// 只把真实 Challenge POST 校验失败计入连续失败次数；首次访问没有 Key 不属于失败。
+		this.recordUAMChallengeFailure(remoteAddr, policy)
+
 		// 对外保持固定 JSON，不暴露 Key、加密或校验失败的内部细节。
 		remotelogs.Warn("UAM", "UAM challenge failed: "+err.Error())
 		this.writeUAMResult(false)
+		return true
 	}
+
+	// “连续失败”在成功通过 Challenge 后立即清零；不额外引入未经 1.3.x 证据确认的时间窗口。
+	sharedUAMFailureTracker.Reset(this.uamFailureKey(remoteAddr))
 	return true
+}
+
+func (this *HTTPRequest) recordUAMChallengeFailure(remoteAddr string, policy *nodeconfigs.UAMPolicy) {
+	if remoteAddr == "" || policy == nil || this == nil || this.ReqServer == nil {
+		return
+	}
+	if policy.MaxFails <= 0 || policy.BlockSeconds <= 0 {
+		return
+	}
+
+	failureKey := this.uamFailureKey(remoteAddr)
+	fails := sharedUAMFailureTracker.Increase(failureKey)
+	if fails < policy.MaxFails {
+		return
+	}
+
+	// 历史商业版明确存在“超过 N 次验证不通过自动加入 IP 黑名单”和防火墙拦截范围。
+	// 这里复用节点现有临时黑名单；由于尚无证据证明 UAM 会直接调用 OS 本地防火墙，
+	// useLocalFirewall 保持 false，避免扩大封禁语义。
+	waf.SharedIPBlackList.RecordIP(
+		waf.IPTypeAll,
+		policy.FirewallScope(),
+		this.ReqServer.Id,
+		remoteAddr,
+		time.Now().Unix()+int64(policy.BlockSeconds),
+		0,
+		false,
+		0,
+		0,
+		"5秒盾验证连续失败超过"+strconv.Itoa(policy.MaxFails)+"次",
+	)
+
+	// 已经转入临时黑名单后清除失败计数，避免直接伪造 Challenge POST 不断延长同一次封禁。
+	sharedUAMFailureTracker.Reset(failureKey)
 }
 
 func (this *HTTPRequest) findUAMPolicy() *nodeconfigs.UAMPolicy {
@@ -197,6 +238,10 @@ func (this *HTTPRequest) uamQPSKey(remoteAddr string) string {
 		serverId = this.ReqServer.Id
 	}
 	return strconv.FormatInt(serverId, 10) + "@" + remoteAddr
+}
+
+func (this *HTTPRequest) uamFailureKey(remoteAddr string) string {
+	return "uam:fail:" + this.uamQPSKey(remoteAddr)
 }
 
 func (this *HTTPRequest) isUAMTemporarilyAllowed(remoteAddr string) bool {
