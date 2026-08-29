@@ -1,6 +1,7 @@
 package cc
 
 import (
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -47,6 +48,52 @@ func TestIncreaseThresholdUsesNativeCounter(t *testing.T) {
 	}
 	if value := IncreaseThreshold(serverID, clientKey, "", false, period); value != 2 {
 		t.Fatalf("第二次计数应为 2，实际 %d", value)
+	}
+}
+
+func TestIncreaseThresholdWithFingerprintUsesLargerValue(t *testing.T) {
+	serverID := int64(9_000_003)
+	remoteAddr := "198.51.100.30"
+	fingerprint := []byte{0x01, 0x02, 0xab, 0xcd}
+	period := 60
+	ipKey := ThresholdCounterKey(serverID, remoteAddr, "", false, period)
+	fpClientKey := hex.EncodeToString(fingerprint)
+	fpKey := ThresholdCounterKey(serverID, fpClientKey, "", false, period)
+	counters.SharedCounter.ResetKey(ipKey)
+	counters.SharedCounter.ResetKey(fpKey)
+	defer counters.SharedCounter.ResetKey(ipKey)
+	defer counters.SharedCounter.ResetKey(fpKey)
+
+	// 先给同一指纹制造更高的历史计数，再模拟当前请求同时增加 IP 和指纹。
+	IncreaseThreshold(serverID, fpClientKey, "", false, period)
+	IncreaseThreshold(serverID, fpClientKey, "", false, period)
+
+	value := IncreaseThresholdWithFingerprint(serverID, remoteAddr, "", false, period, true, fingerprint)
+	if value != 3 {
+		t.Fatalf("应返回较大的指纹计数 3，实际 %d", value)
+	}
+	if ipValue := counters.SharedCounter.GetKey(ipKey); ipValue != 1 {
+		t.Fatalf("IP 计数应独立为 1，实际 %d", ipValue)
+	}
+}
+
+func TestIncreaseThresholdWithFingerprintCanBeDisabled(t *testing.T) {
+	serverID := int64(9_000_004)
+	remoteAddr := "198.51.100.40"
+	fingerprint := []byte{0xaa, 0xbb}
+	period := 60
+	ipKey := ThresholdCounterKey(serverID, remoteAddr, "", false, period)
+	fpKey := ThresholdCounterKey(serverID, hex.EncodeToString(fingerprint), "", false, period)
+	counters.SharedCounter.ResetKey(ipKey)
+	counters.SharedCounter.ResetKey(fpKey)
+	defer counters.SharedCounter.ResetKey(ipKey)
+	defer counters.SharedCounter.ResetKey(fpKey)
+
+	if value := IncreaseThresholdWithFingerprint(serverID, remoteAddr, "", false, period, false, fingerprint); value != 1 {
+		t.Fatalf("关闭指纹后应只返回 IP 计数 1，实际 %d", value)
+	}
+	if fpValue := counters.SharedCounter.GetKey(fpKey); fpValue != 0 {
+		t.Fatalf("关闭指纹后不应增加指纹计数，实际 %d", fpValue)
 	}
 }
 
