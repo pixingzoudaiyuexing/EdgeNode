@@ -35,6 +35,17 @@ func TestQPSCounterKeyDoesNotContainPathDimension(t *testing.T) {
 	}
 }
 
+func TestRedirectCounterKeySeparatesDurations(t *testing.T) {
+	shortWindow := RedirectCounterKey(10, "1.2.3.4", 60)
+	longWindow := RedirectCounterKey(10, "1.2.3.4", 120)
+	if shortWindow == longWindow {
+		t.Fatal("不同连续重定向统计周期必须使用不同 key")
+	}
+	if !strings.Contains(longWindow, ":redirect:10:120:1.2.3.4") {
+		t.Fatalf("unexpected redirect key: %q", longWindow)
+	}
+}
+
 func TestIncreaseThresholdUsesNativeCounter(t *testing.T) {
 	serverID := int64(9_000_001)
 	clientKey := "cc-test-threshold-client"
@@ -112,6 +123,22 @@ func TestIncreaseQPSUsesNativeCounter(t *testing.T) {
 	}
 }
 
+func TestIncreaseRedirectUsesNativeCounter(t *testing.T) {
+	serverID := int64(9_000_005)
+	remoteAddr := "198.51.100.50"
+	duration := 120
+	key := RedirectCounterKey(serverID, remoteAddr, duration)
+	counters.SharedCounter.ResetKey(key)
+	defer counters.SharedCounter.ResetKey(key)
+
+	if value := IncreaseRedirect(serverID, remoteAddr, duration); value != 1 {
+		t.Fatalf("第一次连续重定向计数应为 1，实际 %d", value)
+	}
+	if value := IncreaseRedirect(serverID, remoteAddr, duration); value != 2 {
+		t.Fatalf("第二次连续重定向计数应为 2，实际 %d", value)
+	}
+}
+
 func TestIncreaseCountersRejectInvalidInputs(t *testing.T) {
 	if value := IncreaseThreshold(0, "1.2.3.4", "", false, 60); value != 0 {
 		t.Fatalf("无效 serverId 应返回 0，实际 %d", value)
@@ -127,5 +154,14 @@ func TestIncreaseCountersRejectInvalidInputs(t *testing.T) {
 	}
 	if value := IncreaseQPS(1, ""); value != 0 {
 		t.Fatalf("空 remote addr 应返回 0，实际 %d", value)
+	}
+	if value := IncreaseRedirect(0, "1.2.3.4", 120); value != 0 {
+		t.Fatalf("无效 redirect serverId 应返回 0，实际 %d", value)
+	}
+	if value := IncreaseRedirect(1, "", 120); value != 0 {
+		t.Fatalf("空 redirect remote addr 应返回 0，实际 %d", value)
+	}
+	if value := IncreaseRedirect(1, "1.2.3.4", 0); value != 0 {
+		t.Fatalf("无效 redirect duration 应返回 0，实际 %d", value)
 	}
 }
