@@ -30,6 +30,12 @@ func (this *HTTPRequest) doCC() (block bool) {
 	}
 
 	policy := this.findHTTPCCPolicy()
+	// 可信 1.3.9 Plus doCC() 静态控制流确认：集群策略缺失时仍继续使用网站
+	// 自定义 CC 配置；但策略对象明确存在且 IsOn=false 时会立即退出整个 CC 请求链。
+	if policy != nil && !policy.IsOn {
+		return false
+	}
+
 	config := edgecc.ResolveConfig(this.web.CC, policy)
 	if config == nil || len(config.Thresholds) == 0 {
 		return false
