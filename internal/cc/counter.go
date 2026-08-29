@@ -1,6 +1,7 @@
 package cc
 
 import (
+	"encoding/hex"
 	"strconv"
 	"strings"
 
@@ -45,6 +46,24 @@ func IncreaseThreshold(serverId int64, clientKey string, requestPath string, wit
 	}
 	key := ThresholdCounterKey(serverId, clientKey, requestPath, withRequestPath, periodSeconds)
 	return counters.SharedCounter.IncreaseKey(key, periodSeconds)
+}
+
+// IncreaseThresholdWithFingerprint 同时按来源 IP 和 HTTPS 连接指纹统计，并返回较大值。
+//
+// 1.3.9 的 WAF cc2 已公开确认使用同样策略：先统计 remoteAddr，再将连接指纹
+// 格式化为十六进制作为第二个 client key 独立计数，最终取两者最大值。这样同一代理
+// 出口下不断变化 IP / 客户端来源时，指纹统计仍可提供额外识别能力。
+func IncreaseThresholdWithFingerprint(serverId int64, remoteAddr string, requestPath string, withRequestPath bool, periodSeconds int, enableFingerprint bool, fingerprint []byte) uint32 {
+	ipValue := IncreaseThreshold(serverId, remoteAddr, requestPath, withRequestPath, periodSeconds)
+	if !enableFingerprint || len(fingerprint) == 0 {
+		return ipValue
+	}
+
+	fingerprintValue := IncreaseThreshold(serverId, hex.EncodeToString(fingerprint), requestPath, withRequestPath, periodSeconds)
+	if fingerprintValue > ipValue {
+		return fingerprintValue
+	}
+	return ipValue
 }
 
 // IncreaseQPS 使用同一套 1.3.9 原生 Counter 记录单 IP 最近一分钟请求数。
