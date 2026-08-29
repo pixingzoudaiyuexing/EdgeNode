@@ -20,11 +20,6 @@ func (this *Node) execHTTPCCPolicyChangedTask(rpcClient *rpc.RPCClient) error {
 	return nil
 }
 
-func (this *Node) execHTTP3PolicyChangedTask(rpcClient *rpc.RPCClient) error {
-	// stub
-	return nil
-}
-
 func (this *Node) execHTTPPagesPolicyChangedTask(rpcClient *rpc.RPCClient) error {
 	// stub
 	return nil
