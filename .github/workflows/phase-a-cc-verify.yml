@@ -113,6 +113,10 @@ jobs:
             ../EdgeCommon/pkg/serverconfigs/http_auth_type_ci_plus.go \
             ../EdgeCommon/pkg/nodeconfigs/toa_config_ci_plus.go
 
+      - name: Plus CC request tests
+        working-directory: EdgeNode
+        run: go test -tags plus ./internal/nodes -run '^(TestHTTPRequestDoCCObservesCustomThreshold|TestHTTPRequestDoCCSkipsCommonFileBeforeCounting)$'
+
       - name: Type-check Plus CC request chain
         working-directory: EdgeNode
         shell: bash
