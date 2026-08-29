@@ -190,20 +190,20 @@ func TestHTTPRequestDoCCAppliesOnlyAndExceptURLBeforeCounting(t *testing.T) {
 	}
 
 	qpsKey := edgecc.QPSCounterKey(serverID, remoteAddr)
-	thresholdKey := edgecc.ThresholdCounterKey(serverID, remoteAddr, "/search?q=ok", false, period)
 	counters.SharedCounter.ResetKey(qpsKey)
-	counters.SharedCounter.ResetKey(thresholdKey)
 	defer counters.SharedCounter.ResetKey(qpsKey)
-	defer counters.SharedCounter.ResetKey(thresholdKey)
 
 	makeRequest := func(rawURL string) *HTTPRequest {
 		req := httptest.NewRequest("GET", rawURL, nil)
 		req.RemoteAddr = remoteAddr + ":45678"
+		requestURI := req.URL.RequestURI()
 		return &HTTPRequest{
 			RawReq:     req,
 			ReqHost:    req.Host,
 			ReqServer: &serverconfigs.ServerConfig{Id: serverID},
 			web:       &serverconfigs.HTTPWebConfig{CC: config},
+			rawURI:    requestURI,
+			uri:       requestURI,
 		}
 	}
 
