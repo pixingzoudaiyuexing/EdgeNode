@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p audit/input audit/extracted audit/output
+          mkdir -p audit/input audit/extracted audit/output audit/tools
           curl -fL --retry 3 --retry-delay 2 \
             'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
             -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
@@ -70,14 +70,120 @@ jobs:
             audit/output/nm-all.txt > audit/output/nm-cc.txt || true
 
           strings -a -n 6 "${BIN}" > audit/output/strings-all.txt
-          grep -Ei -C 3 'GE/CC/VALIDATOR|redirectsChecking|validatePath|maxRedirects|maxConnectionsPerIP|maxRequests|blockSeconds|minQPSPerIP|enableGET302|enableFingerprint|ignoreCommonAgents|ignoreCommonFiles|withRequestPath|useDefaultThresholds' \
+          grep -Ei -C 4 'HTTPRequest.*doCC|doCC|HTTPCC|SharedIPBlackList|RecordIP|IncreaseKey|ClientConn.*Bind|GE/CC/VALIDATOR|redirectsChecking|validatePath|maxRedirects|maxConnectionsPerIP|maxRequests|blockSeconds|minQPSPerIP|enableGET302|enableFingerprint|ignoreCommonAgents|ignoreCommonFiles|withRequestPath|useDefaultThresholds' \
             audit/output/strings-all.txt > audit/output/strings-cc.txt || true
 
-          # 尝试反汇编 doCC；若原二进制被 strip，此步允许无结果。
-          go tool objdump -s '.*HTTPRequest.*doCC.*' "${BIN}" > audit/output/objdump-doCC.txt 2>&1 || true
+          # 旧的 ELF 符号表在原版中已被 strip；保留结果用于证明这一点。
+          go tool objdump -s '.*HTTPRequest.*doCC.*' "${BIN}" > audit/output/objdump-doCC-by-symbol.txt 2>&1 || true
 
           # 只保留与本轮 CC 还原直接相关的上下文，避免上传庞大的全量 strings/nm。
           rm -f audit/output/strings-all.txt audit/output/nm-all.txt
+
+      - name: Recover Go function table from pclntab
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # Go 1.2+ 即使 ELF .symtab 被 strip，.gopclntab 仍保存运行时函数表。
+          # debug/gosym.NewTable(nil, pcln) 会直接从 pclntab 生成 Funcs；这里只读文件。
+          cat > audit/tools/pcln.go <<'EOF'
+          package main
+
+          import (
+              "debug/elf"
+              "debug/gosym"
+              "fmt"
+              "os"
+              "strings"
+          )
+
+          func main() {
+              if len(os.Args) != 2 {
+                  panic("usage: pcln <elf>")
+              }
+              f, err := elf.Open(os.Args[1])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+
+              text := f.Section(".text")
+              pclnSec := f.Section(".gopclntab")
+              if text == nil || pclnSec == nil {
+                  panic("missing .text or .gopclntab")
+              }
+              pcln, err := pclnSec.Data()
+              if err != nil {
+                  panic(err)
+              }
+              var symtab []byte
+              if s := f.Section(".gosymtab"); s != nil {
+                  symtab, _ = s.Data()
+              }
+
+              table, err := gosym.NewTable(symtab, gosym.NewLineTable(pcln, text.Addr))
+              if err != nil {
+                  panic(err)
+              }
+
+              var exact *gosym.Func
+              for i := range table.Funcs {
+                  fn := &table.Funcs[i]
+                  if fn.Sym == nil {
+                      continue
+                  }
+                  name := fn.Sym.Name
+                  lower := strings.ToLower(name)
+                  if strings.Contains(lower, "docc") ||
+                      strings.Contains(lower, "httpcc") ||
+                      strings.Contains(lower, "ccpolicy") ||
+                      strings.Contains(lower, "redirectschecking") ||
+                      strings.Contains(lower, "recordip") ||
+                      strings.Contains(lower, "increasekey") ||
+                      strings.Contains(lower, "clientconn") && strings.Contains(lower, "bind") {
+                      fmt.Printf("FUNC\t0x%x\t0x%x\t%s\n", fn.Entry, fn.End, name)
+                  }
+                  if strings.HasSuffix(name, "HTTPRequest).doCC") || strings.HasSuffix(name, "HTTPRequest).doCC-fm") {
+                      if exact == nil || strings.HasSuffix(name, "HTTPRequest).doCC") {
+                          exact = fn
+                      }
+                  }
+              }
+
+              if exact == nil || exact.Sym == nil {
+                  fmt.Fprintln(os.Stderr, "未从 pclntab 找到 HTTPRequest.doCC")
+                  os.Exit(2)
+              }
+              fmt.Printf("DOCC\t0x%x\t0x%x\t%s\n", exact.Entry, exact.End, exact.Sym.Name)
+          }
+          EOF
+
+          go run audit/tools/pcln.go "${BIN}" | tee audit/output/pcln-cc.txt
+          grep '^DOCC' audit/output/pcln-cc.txt > audit/output/doCC-range.txt
+
+      - name: Disassemble recovered doCC address range
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          ENTRY="$(awk -F '\t' '$1=="DOCC" {print $2; exit}' audit/output/doCC-range.txt)"
+          END="$(awk -F '\t' '$1=="DOCC" {print $3; exit}' audit/output/doCC-range.txt)"
+
+          if [ -z "${ENTRY}" ] || [ -z "${END}" ]; then
+            echo '没有恢复 doCC 地址范围' >&2
+            exit 1
+          fi
+
+          # 两种反汇编器都按已恢复的地址范围工作；仍然只是读取 ELF 字节。
+          go tool objdump "${BIN}" "${ENTRY}" "${END}" > audit/output/objdump-doCC-by-address.txt 2>&1 || true
+          objdump -d -M intel --start-address="${ENTRY}" --stop-address="${END}" "${BIN}" \
+            > audit/output/gnu-objdump-doCC.txt 2>&1 || true
+
+          {
+            echo "ENTRY=${ENTRY}"
+            echo "END=${END}"
+          } > audit/output/doCC-address.env
 
       - name: Summarize audit gates
         shell: bash
@@ -88,10 +194,10 @@ jobs:
             echo
             echo '- 归档 MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
             echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
-            echo '- 本 workflow 未执行 edge-node，仅做文件解析/字符串/符号/反汇编。'
+            echo '- 本 workflow 未执行 edge-node，仅做文件解析/字符串/pclntab/地址反汇编。'
             echo
-            echo '## CC 符号'
-            cat audit/output/nm-cc.txt 2>/dev/null || true
+            echo '## pclntab 恢复出的 CC 相关函数'
+            cat audit/output/pcln-cc.txt 2>/dev/null || true
             echo
             echo '## CC 字符串'
             cat audit/output/strings-cc.txt 2>/dev/null || true
