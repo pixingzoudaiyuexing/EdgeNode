@@ -1,0 +1,107 @@
+name: Phase A CC Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-cc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Download trusted 1.3.9 Plus archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+
+          # 只有与 2024-05-20 上午版公开存档哈希完全一致的包才继续。
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          sha256sum audit/input/edge-node-linux-amd64-plus-v1.3.9.zip | tee audit/output/archive-sha256.txt
+
+      - name: Extract and verify original node binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          if [ -z "${BIN}" ]; then
+            echo '未找到 edge-node 可执行文件' >&2
+            exit 1
+          fi
+          echo "${BIN}" > audit/output/binary-path.txt
+
+          # 公开记录中的上午安全版 edge-node 本体 MD5。
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          sha256sum "${BIN}" | tee audit/output/binary-sha256.txt
+
+      - name: Collect static metadata only
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # 以下命令只解析文件，不启动 edge-node。
+          file "${BIN}" | tee audit/output/file.txt
+          go version -m "${BIN}" > audit/output/go-version-m.txt 2>&1 || true
+          readelf -h "${BIN}" > audit/output/elf-header.txt 2>&1 || true
+          readelf -S "${BIN}" > audit/output/elf-sections.txt 2>&1 || true
+
+          go tool nm "${BIN}" > audit/output/nm-all.txt 2>&1 || true
+          grep -Ei 'HTTPRequest.*doCC|HTTPCC|CCPolicy|RedirectsChecking|VALIDATOR|MaxRequests|BlockSeconds|MaxConnections' \
+            audit/output/nm-all.txt > audit/output/nm-cc.txt || true
+
+          strings -a -n 6 "${BIN}" > audit/output/strings-all.txt
+          grep -Ei -C 3 'GE/CC/VALIDATOR|redirectsChecking|validatePath|maxRedirects|maxConnectionsPerIP|maxRequests|blockSeconds|minQPSPerIP|enableGET302|enableFingerprint|ignoreCommonAgents|ignoreCommonFiles|withRequestPath|useDefaultThresholds' \
+            audit/output/strings-all.txt > audit/output/strings-cc.txt || true
+
+          # 尝试反汇编 doCC；若原二进制被 strip，此步允许无结果。
+          go tool objdump -s '.*HTTPRequest.*doCC.*' "${BIN}" > audit/output/objdump-doCC.txt 2>&1 || true
+
+          # 只保留与本轮 CC 还原直接相关的上下文，避免上传庞大的全量 strings/nm。
+          rm -f audit/output/strings-all.txt audit/output/nm-all.txt
+
+      - name: Summarize audit gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# GoEdge 1.3.9 Plus EdgeNode 静态审计'
+            echo
+            echo '- 归档 MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
+            echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
+            echo '- 本 workflow 未执行 edge-node，仅做文件解析/字符串/符号/反汇编。'
+            echo
+            echo '## CC 符号'
+            cat audit/output/nm-cc.txt 2>/dev/null || true
+            echo
+            echo '## CC 字符串'
+            cat audit/output/strings-cc.txt 2>/dev/null || true
+          } > audit/output/summary.md
+
+      - name: Upload static audit text
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-static-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
