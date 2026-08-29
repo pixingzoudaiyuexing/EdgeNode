@@ -1,0 +1,166 @@
+name: Phase A CC Global Range Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-global-range-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-global-range:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Prepare trusted binary and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/tools audit/input audit/extracted audit/output
+          (
+            cd audit/GoReSym
+            test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+            go build -trimpath -o ../tools/goresym .
+          )
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/node.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/node.zip' | md5sum -c -
+          unzip -q audit/input/node.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+          audit/tools/goresym -d "${BIN}" > audit/goresym.json
+          objdump -d -M intel "${BIN}" > audit/all.asm
+
+      - name: Find every code reference around CC global
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import bisect, json, re
+          from pathlib import Path
+
+          data=json.loads(Path('audit/goresym.json').read_text())
+          funcs=[]
+          for f in list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or []):
+              def n(v): return int(v,0) if isinstance(v,str) else int(v or 0)
+              s,e=n(f.get('Start')),n(f.get('End'))
+              if e>s:
+                  funcs.append((s,e,f.get('FullName') or ''))
+          funcs.sort()
+          starts=[x[0] for x in funcs]
+          def owner(pc):
+              i=bisect.bisect_right(starts,pc)-1
+              if i>=0 and funcs[i][0] <= pc < funcs[i][1]:
+                  return funcs[i]
+              return (0,0,'<unknown>')
+
+          # 目标指针是 0x52f3198。扩大到前后 0x400，捕获通过邻近全局变量
+          # 或 write-barrier 辅助路径形成的基址引用。
+          lo,hi=0x52f2d98,0x52f3598
+          insn_re=re.compile(r'^\s*([0-9a-f]+):\s+.*?#\s*(0x[0-9a-f]+)\b',re.I)
+          rows=[]
+          for line in Path('audit/all.asm').read_text(errors='replace').splitlines():
+              m=insn_re.match(line)
+              if not m: continue
+              pc=int(m.group(1),16); target=int(m.group(2),16)
+              if not (lo <= target <= hi): continue
+              s,e,name=owner(pc)
+              op=line.split('\t')[-1].strip() if '\t' in line else line.strip()
+              rows.append((pc,target,name,op,line))
+          Path('audit/output/cc-global-range-xrefs.tsv').write_text(''.join(
+              f'0x{pc:x}\t0x{target:x}\t{name}\t{op}\n' for pc,target,name,op,_ in rows
+          ))
+          # 只保留 nodes 包 init 相关命中，最适合找全局构造。
+          Path('audit/output/cc-global-range-init-xrefs.tsv').write_text(''.join(
+              f'0x{pc:x}\t0x{target:x}\t{name}\t{op}\n' for pc,target,name,op,_ in rows
+              if name.startswith('github.com/TeaOSLab/EdgeNode/internal/nodes.init')
+          ))
+          # 全部 nodes.init* 入口。
+          init_rows=[x for x in funcs if x[2].startswith('github.com/TeaOSLab/EdgeNode/internal/nodes.init')]
+          Path('audit/output/nodes-init-ranges.tsv').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{name}\n' for s,e,name in init_rows
+          ))
+          PY
+
+          # 给所有全局范围命中 PC 做源码映射；即便 stripped 二进制只保留部分
+          # pclntab，也可作为 GoReSym 函数归属的第二证据。
+          cut -f1 audit/output/cc-global-range-xrefs.tsv | go tool addr2line "$(cat audit/output/binary-path.txt)" \
+            > audit/output/cc-global-range-source-lines.txt 2>&1 || true
+
+      - name: Audit every nodes init for map construction and write barriers
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          python3 - <<'PY'
+          import bisect, json, re
+          from pathlib import Path
+
+          data=json.loads(Path('audit/goresym.json').read_text())
+          funcs=[]
+          for f in list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or []):
+              def n(v): return int(v,0) if isinstance(v,str) else int(v or 0)
+              s,e=n(f.get('Start')),n(f.get('End'))
+              if e>s: funcs.append((s,e,f.get('FullName') or ''))
+          funcs.sort(); starts=[x[0] for x in funcs]
+          start_map={s:name for s,e,name in funcs}
+          init_ranges=[x for x in funcs if x[2].startswith('github.com/TeaOSLab/EdgeNode/internal/nodes.init')]
+          asm=Path('audit/all.asm').read_text(errors='replace').splitlines()
+          call_re=re.compile(r'^\s*([0-9a-f]+):.*?\bcall\s+([0-9a-f]+)\b',re.I)
+          pc_re=re.compile(r'^\s*([0-9a-f]+):',re.I)
+          out=[]
+          for s,e,name in init_ranges:
+              out.append(f'===== {name} 0x{s:x}-0x{e:x} =====\n')
+              for line in asm:
+                  m=pc_re.match(line)
+                  if not m: continue
+                  pc=int(m.group(1),16)
+                  if pc < s: continue
+                  if pc >= e: continue
+                  low=line.lower()
+                  interesting=(
+                      'call' in low or '# 0x52f' in low or
+                      '0x2edf640' in low or '0x2de0020' in low or
+                      '0x35c0260' in low or 'writebarrier' in low or
+                      '0x186a0' in low or '0x2710' in low or
+                      '0x10000' in low or '0x20000' in low or '0x8000' in low
+                  )
+                  if not interesting: continue
+                  cm=call_re.match(line)
+                  if cm:
+                      target=int(cm.group(2),16)
+                      callee=start_map.get(target,'<unmapped>')
+                      out.append(f'{line}\t=> {callee}\n')
+                  else:
+                      out.append(line+'\n')
+          Path('audit/output/nodes-init-interesting.txt').write_text(''.join(out))
+          PY
+
+          rm -f audit/all.asm audit/goresym.json
+
+      - name: Upload CC global range audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-global-range-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
