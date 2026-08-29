@@ -1,0 +1,62 @@
+name: Phase A CC Map Xref Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-mapxref-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-map-xref:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup trusted binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/node.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/node.zip' | md5sum -c -
+          unzip -q audit/input/node.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Find exact CC FixedMap RTYPE cross references
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # GoReSym 已确认：
+          # 0x2edf640 = maputils.FixedMap[string,*nodes.ccBlockedCounter]
+          # 0x2de0020 = *maputils.FixedMap[string,*nodes.ccBlockedCounter]
+          # 0x2da36a0 = nodes.ccBlockedCounter
+          # 这里只静态扫描 objdump 文本，不执行目标二进制。
+          objdump -d -M intel "${BIN}" | \
+            grep -B 18 -A 38 -Ei '# 0x2edf640([[:space:]]|$)|# 0x2de0020([[:space:]]|$)|# 0x2da36a0([[:space:]]|$)' \
+            > audit/output/cc-fixedmap-rtype-xrefs.txt || true
+
+          # 另外搜索泛型 Get/Put 使用的 dictionary 地址，帮助把构造点与 increaseCCCounter 对齐。
+          objdump -d -M intel "${BIN}" | \
+            grep -B 18 -A 38 -Ei '# 0x35c0260([[:space:]]|$)' \
+            > audit/output/cc-fixedmap-dictionary-xrefs.txt || true
+
+          test -s audit/output/cc-fixedmap-rtype-xrefs.txt
+
+      - name: Upload CC FixedMap xref audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-mapxref-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
