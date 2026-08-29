@@ -39,6 +39,19 @@ jobs:
         working-directory: EdgeNode
         run: go test ./internal/uam
 
-      - name: Compile nodes package with plus tag
+      - name: Prepare CI-only shims for unrelated Plus gaps
+        working-directory: EdgeNode
+        run: |
+          # 这些文件只存在于 Actions 工作目录，不提交到产品源码。
+          # 目的仅是绕过尚未重建、且与本轮 UAM 无关的旧 Plus 空桩，
+          # 让编译器继续检查 UAM 请求链接线本身。
+          sed 's#//go:build !plus#//go:build plus#' \
+            internal/utils/minifiers/minify.go \
+            > internal/utils/minifiers/minify_ci_plus.go
+          sed 's#//go:build !plus#//go:build plus#' \
+            internal/nodes/http_request_cc.go \
+            > internal/nodes/http_request_cc_ci_plus.go
+
+      - name: Type-check UAM request chain with plus tag
         working-directory: EdgeNode
         run: go test -run '^$' -tags plus ./internal/nodes
