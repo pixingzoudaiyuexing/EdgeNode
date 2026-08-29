@@ -38,6 +38,14 @@ func QPSCounterKey(serverId int64, remoteAddr string) string {
 	return counterPrefix + ":qps:" + strconv.FormatInt(serverId, 10) + ":" + remoteAddr
 }
 
+// RedirectCounterKey 生成 CC GET302 连续重定向检测的计数 key。
+//
+// HTTPCCPolicy.RedirectsChecking 的统计周期可以配置；与普通阈值计数相同，
+// period 必须进入 key，避免同一 IP 在策略热更新后复用旧 Counter 生命周期。
+func RedirectCounterKey(serverId int64, remoteAddr string, durationSeconds int) string {
+	return counterPrefix + ":redirect:" + strconv.FormatInt(serverId, 10) + ":" + strconv.Itoa(durationSeconds) + ":" + remoteAddr
+}
+
 // IncreaseThreshold 使用 1.3.9 原生时间分片 Counter 记录一次阈值请求。
 // 本函数只返回当前统计值，不解释 MaxRequests 的触发边界。
 func IncreaseThreshold(serverId int64, clientKey string, requestPath string, withRequestPath bool, periodSeconds int) uint32 {
@@ -72,4 +80,15 @@ func IncreaseQPS(serverId int64, remoteAddr string) uint32 {
 		return 0
 	}
 	return counters.SharedCounter.IncreaseKey(QPSCounterKey(serverId, remoteAddr), 60)
+}
+
+// IncreaseRedirect 记录一次 CC GET302 重定向行为。
+//
+// 这里只累计 HTTPCCPolicy.RedirectsChecking.DurationSeconds 时间窗内的次数，
+// 不解释 MaxRedirects 的触发边界，也不负责封禁，避免在原版比较语义未确认前猜测。
+func IncreaseRedirect(serverId int64, remoteAddr string, durationSeconds int) uint32 {
+	if serverId <= 0 || remoteAddr == "" || durationSeconds <= 0 {
+		return 0
+	}
+	return counters.SharedCounter.IncreaseKey(RedirectCounterKey(serverId, remoteAddr, durationSeconds), durationSeconds)
 }
