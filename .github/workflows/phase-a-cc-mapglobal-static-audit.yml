@@ -1,0 +1,58 @@
+name: Phase A CC Map Global Static Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-mapglobal-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-map-global:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup trusted binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/node.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/node.zip' | md5sum -c -
+          unzip -q audit/input/node.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Find all references to CC FixedMap global
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          # 0x52f3198 已由可信 doCC helper 汇编确认是
+          # FixedMap[string,*ccBlockedCounter] 的全局指针。
+          objdump -d -M intel "${BIN}" | \
+            grep -B 40 -A 60 -E '# 0x52f3198([[:space:]]|$)' \
+            > audit/output/cc-map-global-xrefs.txt || true
+          test -s audit/output/cc-map-global-xrefs.txt
+
+          # 同时筛出所有写入该全局变量前后的立即数，便于识别 maxSize。
+          grep -n -B 25 -A 35 -E '# 0x52f3198([[:space:]]|$)' \
+            audit/output/cc-map-global-xrefs.txt \
+            > audit/output/cc-map-global-write-context.txt || true
+
+      - name: Upload CC map global audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-mapglobal-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
