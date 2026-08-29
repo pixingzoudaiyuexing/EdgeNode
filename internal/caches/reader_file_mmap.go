@@ -127,6 +127,17 @@ func (this *MMAPFileReader) BodySize() int64 {
 	return this.bodySize
 }
 
+// CopyBodyTo 直接把映射中的 Body 区域复制给目标 Writer。
+// 该方法不改变当前 Reader 的游标，保持与原 Plus 具体类型接口兼容。
+func (this *MMAPFileReader) CopyBodyTo(writer io.Writer) (int, error) {
+	if this.mapped == nil || this.bodySize == 0 {
+		return 0, nil
+	}
+	reader := io.NewSectionReader(this.mapped, this.bodyOffset, this.bodySize)
+	n, err := io.Copy(writer, reader)
+	return int(n), err
+}
+
 func (this *MMAPFileReader) ReadHeader(buf []byte, callback ReaderFunc) error {
 	if this.headerSize == 0 {
 		_, err := this.reader.Seek(this.bodyOffset, io.SeekStart)
