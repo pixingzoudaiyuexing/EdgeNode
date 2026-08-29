@@ -15,13 +15,29 @@ jobs:
   audit-cc:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout EdgeNode
         uses: actions/checkout@v4
+
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.21.x"
+
+      - name: Build pinned GoReSym
+        working-directory: audit/GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+          go build -trimpath -o ../GoReSym .
+          ../GoReSym -about > ../output-goresym-about.txt 2>&1 || true
 
       - name: Download trusted 1.3.9 Plus archive
         shell: bash
@@ -160,30 +176,159 @@ jobs:
           EOF
 
           go run audit/tools/pcln.go "${BIN}" | tee audit/output/pcln-cc.txt
-          grep '^DOCC' audit/output/pcln-cc.txt > audit/output/doCC-range.txt
+          grep '^DOCC' audit/output/pcln-cc.txt > audit/output/doCC-range-gosym.txt
 
-      - name: Disassemble recovered doCC address range
+      - name: Recover authoritative function boundaries with GoReSym
         shell: bash
         run: |
           set -euo pipefail
           BIN="$(cat audit/output/binary-path.txt)"
-          ENTRY="$(awk -F '\t' '$1=="DOCC" {print $2; exit}' audit/output/doCC-range.txt)"
-          END="$(awk -F '\t' '$1=="DOCC" {print $3; exit}' audit/output/doCC-range.txt)"
 
-          if [ -z "${ENTRY}" ] || [ -z "${END}" ]; then
-            echo '没有恢复 doCC 地址范围' >&2
+          # GoReSym 专门处理 stripped Go binary，并从 runtime moduledata/pclntab 恢复函数信息。
+          # 这里运行的是分析工具 audit/GoReSym，目标 edge-node 仍然只作为输入文件被读取。
+          audit/GoReSym -d -p "${BIN}" > audit/goresym-full.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('audit/goresym-full.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+
+          def as_int(value):
+              if isinstance(value, int):
+                  return value
+              if isinstance(value, str):
+                  return int(value, 0)
+              return int(value or 0)
+
+          rows = []
+          for fn in funcs:
+              name = fn.get('FullName') or ''
+              start = as_int(fn.get('Start'))
+              end = as_int(fn.get('End'))
+              rows.append((start, end, name))
+          rows.sort()
+
+          needles = (
+              'docc', 'httpcc', 'ccpolicy', 'redirectschecking', 'recordip',
+              'increasekey', 'clientconn', 'validator', 'fingerprint', 'get302'
+          )
+          cc_rows = [row for row in rows if any(n in row[2].lower() for n in needles)]
+          Path('audit/output/goresym-cc-functions.txt').write_text(
+              ''.join(f'FUNC\t0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in cc_rows)
+          )
+
+          exact = [row for row in rows if row[2].endswith('HTTPRequest).doCC')]
+          if len(exact) != 1:
+              candidates = [row for row in rows if 'httprequest' in row[2].lower() and 'docc' in row[2].lower()]
+              raise SystemExit(f'GoReSym 未唯一定位 HTTPRequest.doCC: exact={exact!r}, candidates={candidates!r}')
+
+          start, end, name = exact[0]
+          Path('audit/output/doCC-range-goresym.txt').write_text(
+              f'DOCC\t0x{start:x}\t0x{end:x}\t{name}\n'
+          )
+
+          # 输出真实函数表中 doCC 前后各 8 个函数，检查边界是否跨越其他函数。
+          idx = rows.index(exact[0])
+          nearby = rows[max(0, idx-8):idx+9]
+          Path('audit/output/doCC-neighborhood-goresym.txt').write_text(
+              ''.join(f'FUNC\t0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in nearby)
+          )
+
+          # 供后续 call target 映射使用；该文件只留在临时工作目录，不上传全量函数表。
+          Path('audit/goresym-functions.tsv').write_text(
+              ''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in rows)
+          )
+          PY
+
+          # 不上传完整 GoReSym JSON，避免 artifact 无谓膨胀；只保留筛选后的函数元数据。
+          rm -f audit/goresym-full.json
+
+      - name: Cross-check doCC ranges and disassemble GoReSym range
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          GOSYM_ENTRY="$(awk -F '\t' '$1=="DOCC" {print $2; exit}' audit/output/doCC-range-gosym.txt)"
+          GOSYM_END="$(awk -F '\t' '$1=="DOCC" {print $3; exit}' audit/output/doCC-range-gosym.txt)"
+          GORESYM_ENTRY="$(awk -F '\t' '$1=="DOCC" {print $2; exit}' audit/output/doCC-range-goresym.txt)"
+          GORESYM_END="$(awk -F '\t' '$1=="DOCC" {print $3; exit}' audit/output/doCC-range-goresym.txt)"
+
+          {
+            echo "GOSYM_ENTRY=${GOSYM_ENTRY}"
+            echo "GOSYM_END=${GOSYM_END}"
+            echo "GORESYM_ENTRY=${GORESYM_ENTRY}"
+            echo "GORESYM_END=${GORESYM_END}"
+            if [ "${GOSYM_ENTRY}" = "${GORESYM_ENTRY}" ] && [ "${GOSYM_END}" = "${GORESYM_END}" ]; then
+              echo 'RANGE_MATCH=yes'
+            else
+              echo 'RANGE_MATCH=no'
+            fi
+          } | tee audit/output/doCC-range-crosscheck.txt
+
+          if [ -z "${GORESYM_ENTRY}" ] || [ -z "${GORESYM_END}" ]; then
+            echo 'GoReSym 没有恢复 doCC 地址范围' >&2
             exit 1
           fi
 
-          # 两种反汇编器都按已恢复的地址范围工作；仍然只是读取 ELF 字节。
-          go tool objdump "${BIN}" "${ENTRY}" "${END}" > audit/output/objdump-doCC-by-address.txt 2>&1 || true
-          objdump -d -M intel --start-address="${ENTRY}" --stop-address="${END}" "${BIN}" \
-            > audit/output/gnu-objdump-doCC.txt 2>&1 || true
+          # 以 GoReSym moduledata 结果为准做地址范围反汇编。
+          objdump -d -M intel --start-address="${GORESYM_ENTRY}" --stop-address="${GORESYM_END}" "${BIN}" \
+            > audit/output/gnu-objdump-doCC-goresym.txt 2>&1
 
-          {
-            echo "ENTRY=${ENTRY}"
-            echo "END=${END}"
-          } > audit/output/doCC-address.env
+          # 保留 gosym 旧范围仅用于比较，不能把它直接当真实边界。
+          objdump -d -M intel --start-address="${GOSYM_ENTRY}" --stop-address="${GOSYM_END}" "${BIN}" \
+            > audit/output/gnu-objdump-doCC-gosym.txt 2>&1 || true
+
+          grep -E '(^|[[:space:]])(cmp|test|j[a-z]+|call)[[:space:]]' \
+            audit/output/gnu-objdump-doCC-goresym.txt \
+            > audit/output/doCC-control-flow-goresym.txt || true
+
+          printf 'GoReSym doCC range 内 INT3 数量: ' > audit/output/doCC-boundary-check.txt
+          grep -Eic '[[:space:]]int3([[:space:]]|$)' audit/output/gnu-objdump-doCC-goresym.txt \
+            >> audit/output/doCC-boundary-check.txt || true
+
+      - name: Map doCC direct call targets back to recovered Go functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          funcs = {}
+          for line in Path('audit/goresym-functions.tsv').read_text().splitlines():
+              start, end, name = line.split('\t', 2)
+              funcs[int(start, 16)] = (int(end, 16), name)
+
+          text = Path('audit/output/gnu-objdump-doCC-goresym.txt').read_text(errors='replace')
+          out = []
+          # GNU objdump x86_64 典型格式：ADDR: ... call TARGET
+          pat = re.compile(r'^\s*([0-9a-f]+):.*?\bcall\s+([0-9a-fx]+)', re.I)
+          for line in text.splitlines():
+              m = pat.search(line)
+              if not m:
+                  continue
+              insn = int(m.group(1), 16)
+              target_text = m.group(2)
+              try:
+                  target = int(target_text, 0 if target_text.lower().startswith('0x') else 16)
+              except ValueError:
+                  continue
+              meta = funcs.get(target)
+              name = meta[1] if meta else '<未映射直接调用>'
+              out.append(f'0x{insn:x}\t0x{target:x}\t{name}\n')
+
+          Path('audit/output/doCC-direct-call-targets.txt').write_text(''.join(out))
+          PY
+
+          grep -Ei 'IncreaseKey|RecordIP|Bind|HTTPCC|Redirect|VALIDATOR|Fingerprint|GET302|IPList|Counter' \
+            audit/output/doCC-direct-call-targets.txt \
+            > audit/output/doCC-security-call-targets.txt || true
+
+          # 全量函数表只是中间映射数据，不进入 artifact。
+          rm -f audit/goresym-functions.tsv
 
       - name: Summarize audit gates
         shell: bash
@@ -194,10 +339,20 @@ jobs:
             echo
             echo '- 归档 MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
             echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
-            echo '- 本 workflow 未执行 edge-node，仅做文件解析/字符串/pclntab/地址反汇编。'
+            echo '- GoReSym 固定 commit: 6fba10d77df98335cbd1fb7839043d1ffde8defb'
+            echo '- 本 workflow 从未执行 edge-node；只运行静态分析工具读取目标 ELF。'
             echo
-            echo '## pclntab 恢复出的 CC 相关函数'
-            cat audit/output/pcln-cc.txt 2>/dev/null || true
+            echo '## doCC 地址交叉检查'
+            cat audit/output/doCC-range-crosscheck.txt 2>/dev/null || true
+            echo
+            echo '## GoReSym 恢复的 doCC 邻域'
+            cat audit/output/doCC-neighborhood-goresym.txt 2>/dev/null || true
+            echo
+            echo '## doCC 安全相关直接调用'
+            cat audit/output/doCC-security-call-targets.txt 2>/dev/null || true
+            echo
+            echo '## GoReSym 恢复出的 CC 相关函数'
+            cat audit/output/goresym-cc-functions.txt 2>/dev/null || true
             echo
             echo '## CC 字符串'
             cat audit/output/strings-cc.txt 2>/dev/null || true
