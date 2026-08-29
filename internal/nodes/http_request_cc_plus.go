@@ -16,24 +16,26 @@ import (
 )
 
 const (
-	ccThresholdTag       = "CCProtection"
-	ccTooManyRequestsEN  = "Too many requests, please wait for a few minutes."
+	ccThresholdTag        = "CCProtection"
+	ccTooManyRequestsEN   = "Too many requests, please wait for a few minutes."
 	ccTooManyRequestsZHCN = "访问过于频繁，请稍等片刻后再访问。"
+	ccConnections403EN    = "The request has been blocked by cc policy."
+	ccConnections403ZHCN  = "当前请求已被CC策略拦截。"
 )
 
-// doCC 执行 Plus 高级 CC 请求链中已经由 1.3.9 证据确认的筛选、统计与请求阈值封禁。
+// doCC 执行 Plus 高级 CC 请求链中已经由 1.3.9 证据确认的筛选、统计和封禁逻辑。
 //
 // 当前已经恢复：
 //   - 节点自动白名单、系统 IP 名单和 CC 临时黑名单的原版检查顺序；
 //   - URL/常见静态文件/MinQPSPerIP 过滤；
+//   - 单 IP 最大连接数检查，默认 30，count >= limit 时触发 403；
 //   - 来源 IP + 可选 HTTPS 指纹的多周期阈值统计；
-//   - count >= MaxRequests 时第 N 次请求立即触发；
-//   - HTTP 429 原版中英文提示；
-//   - BlockSeconds > 0 时按客户端 IP 进行 24 小时、最高 32 倍的重复封禁递增；
-//   - FirewallScope、临时黑名单、本机防火墙范围、CCProtection 标签和攻击标记。
+//   - count >= MaxRequests 时第 N 次请求立即触发 429；
+//   - 两类封禁共用按客户端 IP 计算的 24 小时、最高 32 倍重复封禁递增；
+//   - FirewallScope、临时黑名单、本机防火墙范围，以及请求阈值的 CCProtection 标签/攻击标记。
 //
-// MaxConnectionsPerIP 与 GET302 validator 仍由后续独立阶段接入，避免把尚未完整验证的
-// 行为混进已经可以逐项验收的请求阈值路径。
+// GET302 validator 仍由后续独立阶段接入，避免把尚未完整验证的浏览器重定向协议
+// 混进已经可以逐项验收的连接限制和普通请求阈值路径。
 func (this *HTTPRequest) doCC() (block bool) {
 	if this == nil || this.RawReq == nil || this.web == nil || this.web.CC == nil || !this.web.CC.IsOn {
 		return false
@@ -50,7 +52,7 @@ func (this *HTTPRequest) doCC() (block bool) {
 	}
 
 	config := edgecc.ResolveConfig(this.web.CC, policy)
-	if config == nil || len(config.Thresholds) == 0 {
+	if config == nil {
 		return false
 	}
 
@@ -99,10 +101,33 @@ func (this *HTTPRequest) doCC() (block bool) {
 	}
 
 	// MinQPSPerIP 的官方语义明确为“一分钟平均 QPS 达到设定值”。
-	// 因此这里可以安全确定 >= 边界；0 表示不设置最低门槛。
+	// 原版先通过这个门槛，再检查 MaxConnectionsPerIP 和后续 GET302/请求阈值。
 	requestsLastMinute := edgecc.IncreaseQPS(this.ReqServer.Id, remoteAddr)
 	if !edgecc.ReachedMinQPS(config.MinQPSPerIP, int64(requestsLastMinute)) {
 		return false
+	}
+
+	// 单 IP 最大连接数直接使用连接接入时维护的 conns.SharedMap，不调用 ClientConn.Bind()。
+	// 可信 1.3.9 Plus 行为：policy 缺失或配置 <=0 时上限为 30；count >= limit 的
+	// 第 N 条连接即触发 403，并固定按 1800 秒基础时长乘同一个重复封禁倍率。
+	maxConnectionsPerIP := edgecc.ResolveMaxConnectionsPerIP(policy)
+	if edgecc.MaxConnectionsReached(conns.SharedMap.CountIPConns(remoteAddr), maxConnectionsPerIP) {
+		this.writeCode(http.StatusForbidden, ccConnections403EN, ccConnections403ZHCN)
+
+		multiplier := this.increaseCCCounter(remoteAddr)
+		blockSeconds := int(int32(edgecc.MaxConnectionsBlockSeconds) * multiplier)
+		reason := fmt.Sprintf("CC防护拦截：并发连接数超出%d个", maxConnectionsPerIP)
+		edgecc.RecordBlockedIP(
+			this.ReqServer.Id,
+			remoteAddr,
+			firewallScope,
+			blockSeconds,
+			firewallScope == firewallconfigs.FirewallScopeGlobal,
+			reason,
+		)
+		// 原版此分支不追加 CCProtection/isAttack，也不额外调用 HTTPRequest.Close()；
+		// RecordIP() 会关闭该 IP 当前所有已登记连接。
+		return true
 	}
 
 	fingerprint := this.WAFFingerprint()
