@@ -1,0 +1,40 @@
+name: Phase A CC Verify
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "internal/cc/**"
+      - "internal/nodes/http_request_cc*.go"
+      - ".github/workflows/phase-a-cc-verify.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-cc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+        with:
+          path: EdgeNode
+
+      - name: Checkout EdgeCommon
+        uses: actions/checkout@v4
+        with:
+          repository: pixingzoudaiyuexing/EdgeCommon
+          ref: main
+          path: EdgeCommon
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+          cache-dependency-path: EdgeNode/go.sum
+
+      - name: CC config resolver tests
+        working-directory: EdgeNode
+        run: go test ./internal/cc
