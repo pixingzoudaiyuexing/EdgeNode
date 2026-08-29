@@ -1,0 +1,63 @@
+name: Phase A CC Layout Static Audit
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/phase-a-cc-layout-static-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-layout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+        with:
+          path: EdgeNode
+
+      - name: Checkout EdgeCommon
+        uses: actions/checkout@v4
+        with:
+          repository: pixingzoudaiyuexing/EdgeCommon
+          ref: main
+          path: EdgeCommon
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+          cache-dependency-path: EdgeNode/go.sum
+
+      - name: Read current HTTPRequest isAttack offset
+        working-directory: EdgeNode
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > internal/nodes/http_request_cc_layout_audit_test.go <<'EOF'
+          package nodes
+
+          import (
+              "testing"
+              "unsafe"
+          )
+
+          func TestAuditHTTPRequestIsAttackOffset(t *testing.T) {
+              offset := unsafe.Offsetof(HTTPRequest{}.isAttack)
+              t.Logf("HTTPRequest.isAttack offset=0x%x (%d)", offset, offset)
+          }
+          EOF
+          gofmt -w internal/nodes/http_request_cc_layout_audit_test.go
+          go test ./internal/nodes -run '^TestAuditHTTPRequestIsAttackOffset$' -v 2>&1 | tee cc-layout-audit.log
+
+      - name: Upload layout audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-cc-layout-audit
+          path: EdgeNode/cc-layout-audit.log
+          if-no-files-found: error
+          retention-days: 7
