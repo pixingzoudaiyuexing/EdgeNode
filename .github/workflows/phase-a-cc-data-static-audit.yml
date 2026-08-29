@@ -90,12 +90,13 @@ jobs:
           targets=[
               ('conn_prefix',0x30f0d02,0x26),
               ('conn_suffix',0x3090aff,3),
+              ('conn_403_en',0x30fb160,0x2a),
+              ('conn_403_zh',0x30e7bf1,0x23),
               ('threshold_prefix',0x30c03fd,0x14),
               ('threshold_middle',0x30bb358,0x12),
               ('threshold_suffix',0x3090b08,3),
               ('threshold_429_en',0x310966f,0x31),
               ('threshold_429_zh',0x310ca09,0x33),
-              # 原版阈值命中后 append 到 HTTPRequest.tags 的 12 字节字符串。
               ('threshold_tag',0x30a8fac,12),
           ]
           lines=[]
