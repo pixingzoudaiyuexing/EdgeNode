@@ -45,14 +45,14 @@ func (this *HTTPRequest) doUAM() (block bool) {
 
 	remoteAddr := this.requestRemoteAddr(true)
 	policy := this.findUAMPolicy()
-
-	// Challenge POST 由当前请求直接消费，且在 WAF 之前处理，避免协议自身被 WAF 拦截。
-	if this.isUAMRequest() {
-		return this.doUAMChallenge(remoteAddr, policy)
-	}
-
 	if policy == nil || !policy.IsOn {
 		return false
+	}
+
+	// Challenge POST 由当前请求直接消费，且在 WAF 之前处理，避免协议自身被 WAF 拦截。
+	// 集群策略关闭后不再处理旧 Challenge 回调，也不会继续累计失败次数。
+	if this.isUAMRequest() {
+		return this.doUAMChallenge(remoteAddr, policy)
 	}
 
 	config := this.web.UAM
