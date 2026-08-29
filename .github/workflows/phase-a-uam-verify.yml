@@ -52,6 +52,20 @@ jobs:
             internal/nodes/http_request_cc.go \
             > internal/nodes/http_request_cc_ci_plus.go
 
+          # LN / Plan / HLS / OSS / sendfile 等仍是历史 Plus 私有缺口。
+          # 这里只复制现有 community 空桩给 plus 类型检查使用，不改变产品代码。
+          for source in \
+            http_request_ln.go \
+            http_request_plan_before.go \
+            http_request_hls.go \
+            http_request_oss.go \
+            http_writer_ext.go
+          do
+            target="internal/nodes/${source%.go}_ci_plus.go"
+            sed 's#//go:build !plus#//go:build plus#; s#// +build !plus#// +build plus#' \
+              "internal/nodes/${source}" > "${target}"
+          done
+
           # EdgeCommon 的 OSSConfig 在公开源码中已有 !plus 空实现；
           # CI 中只复制为 plus 版本，避免把尚未恢复的 OSS 私有实现混入 UAM 工作。
           sed 's#//go:build !plus#//go:build plus#; s#// +build !plus#// +build plus#' \
@@ -106,6 +120,11 @@ jobs:
           gofmt -w \
             internal/utils/minifiers/minify_ci_plus.go \
             internal/nodes/http_request_cc_ci_plus.go \
+            internal/nodes/http_request_ln_ci_plus.go \
+            internal/nodes/http_request_plan_before_ci_plus.go \
+            internal/nodes/http_request_hls_ci_plus.go \
+            internal/nodes/http_request_oss_ci_plus.go \
+            internal/nodes/http_writer_ext_ci_plus.go \
             ../EdgeCommon/pkg/serverconfigs/ossconfigs/oss_config_ci_plus.go \
             ../EdgeCommon/pkg/serverconfigs/http_auth_policy_init_ci_plus.go \
             ../EdgeCommon/pkg/serverconfigs/http_auth_type_ci_plus.go \
