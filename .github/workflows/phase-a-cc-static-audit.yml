@@ -36,8 +36,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
-          go build -trimpath -o ../GoReSym .
-          ../GoReSym -about > ../output-goresym-about.txt 2>&1 || true
+          mkdir -p ../tools
+          go build -trimpath -o ../tools/goresym .
+          ../tools/goresym -about > ../tools/goresym-about.txt 2>&1 || true
 
       - name: Download trusted 1.3.9 Plus archive
         shell: bash
@@ -185,8 +186,8 @@ jobs:
           BIN="$(cat audit/output/binary-path.txt)"
 
           # GoReSym 专门处理 stripped Go binary，并从 runtime moduledata/pclntab 恢复函数信息。
-          # 这里运行的是分析工具 audit/GoReSym，目标 edge-node 仍然只作为输入文件被读取。
-          audit/GoReSym -d -p "${BIN}" > audit/goresym-full.json
+          # 这里运行的是分析工具 audit/tools/goresym，目标 edge-node 仍然只作为输入文件被读取。
+          audit/tools/goresym -d -p "${BIN}" > audit/goresym-full.json
 
           python3 - <<'PY'
           import json
