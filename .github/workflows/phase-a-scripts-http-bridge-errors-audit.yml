@@ -1,0 +1,58 @@
+name: Phase A Scripts HTTP Bridge Errors Audit
+
+on:
+  push:
+    branches:
+      - phase-a-scripts-http-bridge
+    paths:
+      - ".github/workflows/phase-a-scripts-http-bridge-errors-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-errors:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and verify trusted 1.3.9 Plus archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 8 --retry-all-errors --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Recover bounded bridge error strings
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          strings -a -n 4 "${BIN}" | python3 -c '
+          import sys
+          needles=("go object", "object not found", "header name should not be empty")
+          out=[]
+          for line in sys.stdin:
+              low=line.lower()
+              if any(n in low for n in needles):
+                  out.append(line)
+          if not out:
+              raise SystemExit("bridge error strings not found")
+          sys.stdout.writelines(out)
+          ' | sort -u | tee audit/output/bridge-errors.txt
+          grep -F 'header name should not be empty' audit/output/bridge-errors.txt
+
+      - name: Upload bridge error evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-scripts-http-bridge-errors
+          path: audit/output/bridge-errors.txt
+          if-no-files-found: error
+          retention-days: 7
