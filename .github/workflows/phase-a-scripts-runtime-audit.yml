@@ -54,11 +54,18 @@ jobs:
           echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
           echo "${BIN}" > audit/output/binary-path.txt
 
-      - name: Recover focused script runtime symbols
+      - name: Recover focused script runtime evidence
         shell: bash
         run: |
           set -euo pipefail
           BIN="$(cat audit/output/binary-path.txt)"
+
+          # 仅读取 Go build info；不会执行目标二进制。
+          go version -m "${BIN}" > audit/output/module-info.txt 2>&1 || true
+          strings -a "${BIN}" | grep -Eai \
+            'http_request_events_script_plus\.go|/scripts/js/|goja|otto|tengo|gopher-lua|gopherlua|javascript|ecmascript|HTTPRequestScriptsConfig|ScriptGroupConfig|ScriptConfig' \
+            | sort -u > audit/output/high-signal-strings.txt || true
+
           audit/tools/goresym -d "${BIN}" > audit/functions.json
 
           python3 - <<'PY'
@@ -67,6 +74,7 @@ jobs:
           import subprocess
           from pathlib import Path
 
+          binary = Path('audit/output/binary-path.txt').read_text().strip()
           data = json.loads(Path('audit/functions.json').read_text())
           funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
 
@@ -85,7 +93,8 @@ jobs:
                   by_start[start] = name
           rows.sort()
 
-          exact_suffixes = (
+          # 不要求 onInit/onRequest 必须保留独立符号。原版可能内联或折叠这些小钩子。
+          needles = (
               '(*HTTPRequest).onInit',
               '(*HTTPRequest).onRequest',
               '(*HTTPRequest).Do',
@@ -93,71 +102,89 @@ jobs:
           )
           targets = {}
           for start, end, name, fn in rows:
-              for suffix in exact_suffixes:
-                  if name.endswith(suffix):
-                      targets[suffix] = (start, end, name)
-
-          missing = [s for s in ('(*HTTPRequest).onInit', '(*HTTPRequest).onRequest') if s not in targets]
-          if missing:
-              raise SystemExit('可信 1.3.9 Plus 中未找到关键脚本钩子: ' + ', '.join(missing))
+              for needle in needles:
+                  if name.endswith(needle):
+                      targets[needle] = (start, end, name)
 
           Path('audit/output/target-ranges.txt').write_text(''.join(
-              f'{suffix}\t0x{start:x}\t0x{end:x}\t{name}\n'
-              for suffix, (start, end, name) in targets.items()
+              f'{needle}\t0x{start:x}\t0x{end:x}\t{name}\n'
+              for needle, (start, end, name) in targets.items()
+          ))
+          Path('audit/output/missing-targets.txt').write_text(''.join(
+              needle + '\n' for needle in needles if needle not in targets
           ))
 
-          # 枚举高度相关的配置与可能脚本引擎符号，但不依靠名字猜运行时行为。
           config_re = re.compile(r'(HTTPRequestScriptsConfig|ScriptGroupConfig|ScriptConfig)', re.I)
-          engine_re = re.compile(r'(goja|otto|tengo|gopher-lua|yuin/gopher|javascript|ecmascript|scriptengine|script/runtime)', re.I)
+          engine_re = re.compile(r'(goja|otto|tengo|gopher-lua|gopherlua|javascript|ecmascript|scriptengine|scripts/js)', re.I)
+          path_re = re.compile(r'http_request_events_script_plus\.go|/scripts/js/|/scripts?/', re.I)
+
           config_symbols = []
           engine_symbols = []
+          source_hits = []
+          near_hook_names = []
           for start, end, name, fn in rows:
-              if config_re.search(name):
+              blob = json.dumps(fn, ensure_ascii=False)
+              if config_re.search(blob):
                   config_symbols.append((start, end, name))
-              if engine_re.search(name):
+              if engine_re.search(blob):
                   engine_symbols.append((start, end, name))
+              if path_re.search(blob):
+                  source_hits.append((start, end, name, blob))
+              if re.search(r'(onInit|onRequest|HTTPRequest.*(script|event)|script.*HTTPRequest)', name, re.I):
+                  near_hook_names.append((start, end, name))
+
           Path('audit/output/script-config-symbols.txt').write_text(''.join(
               f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n in config_symbols
           ))
           Path('audit/output/engine-symbols.txt').write_text(''.join(
-              f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n in engine_symbols[:1000]
+              f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n in engine_symbols[:1600]
+          ))
+          Path('audit/output/near-hook-symbols.txt').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n in near_hook_names
+          ))
+          Path('audit/output/source-path-hits.txt').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{n}\n{blob}\n\n' for s,e,n,blob in source_hits[:400]
           ))
 
-          # 对关键钩子和 Do/doBegin 单独反汇编，并映射直接调用。
           call_re = re.compile(r'\bcall\s+(?:0x)?([0-9a-f]+)', re.I)
-          target_addrs = {v[0]: v[2] for v in targets.values()}
-          config_addrs = {s:n for s,e,n in config_symbols}
-          interesting_addrs = dict(target_addrs)
-          interesting_addrs.update(config_addrs)
 
-          direct_calls = []
-          for suffix, (start, end, name) in targets.items():
-              safe = suffix.replace('(*HTTPRequest).', '').replace('*','').replace('(','').replace(')','')
+          def disassemble(start, end, label):
               asm = subprocess.check_output([
-                  'objdump','-d','-M','intel',f'--start-address=0x{start:x}',f'--stop-address=0x{end:x}',
-                  Path('audit/output/binary-path.txt').read_text().strip()
+                  'objdump','-d','-M','intel',f'--start-address=0x{start:x}',f'--stop-address=0x{end:x}',binary
               ], text=True, errors='replace')
-              Path(f'audit/output/{safe}-objdump.txt').write_text(asm)
+              Path(f'audit/output/{label}-objdump.txt').write_text(asm)
               mapped = []
               for line in asm.splitlines():
                   m = call_re.search(line)
                   if not m:
                       continue
                   addr = int(m.group(1), 16)
-                  callee = by_start.get(addr, '<unknown>')
-                  mapped.append(f'0x{addr:x}\t{callee}\t{line.strip()}\n')
-                  direct_calls.append((name, addr, callee, line.strip()))
-              Path(f'audit/output/{safe}-calls.txt').write_text(''.join(mapped))
+                  mapped.append((addr, by_start.get(addr, '<unknown>'), line.strip()))
+              Path(f'audit/output/{label}-calls.txt').write_text(''.join(
+                  f'0x{addr:x}\t{name}\t{line}\n' for addr,name,line in mapped
+              ))
+              return mapped
 
-          # 只反汇编 EdgeNode internal/nodes 的 HTTPRequest 方法，做反向调用图，避免全二进制噪声。
-          http_funcs = [(s,e,n) for s,e,n,fn in rows if 'EdgeNode/internal/nodes.(*HTTPRequest).' in n]
+          target_calls = {}
+          for needle, (start, end, name) in targets.items():
+              label = needle.replace('(*HTTPRequest).','').replace('*','').replace('(','').replace(')','')
+              target_calls[needle] = disassemble(start, end, label)
+
+          # 如果独立 onInit/onRequest 符号消失，则 Do/doBegin 的完整调用序列仍可用于按公开源码顺序定位内联/折叠实现。
+          # 同时对所有 HTTPRequest 方法构建反向调用信息。
+          interesting = {s:n for s,e,n in config_symbols + engine_symbols + near_hook_names}
+          for needle, (s,e,n) in targets.items():
+              interesting[s] = n
+
           reverse = []
-          all_http_calls = []
-          for start, end, name in http_funcs:
+          http_methods = [(s,e,n) for s,e,n,fn in rows if 'EdgeNode/internal/nodes.(*HTTPRequest).' in n]
+          Path('audit/output/http-request-methods.txt').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n in http_methods
+          ))
+          for start, end, name in http_methods:
               try:
                   asm = subprocess.check_output([
-                      'objdump','-d','-M','intel',f'--start-address=0x{start:x}',f'--stop-address=0x{end:x}',
-                      Path('audit/output/binary-path.txt').read_text().strip()
+                      'objdump','-d','-M','intel',f'--start-address=0x{start:x}',f'--stop-address=0x{end:x}',binary
                   ], text=True, errors='replace')
               except subprocess.CalledProcessError:
                   continue
@@ -166,58 +193,32 @@ jobs:
                   if not m:
                       continue
                   addr = int(m.group(1), 16)
-                  callee = by_start.get(addr, '<unknown>')
-                  all_http_calls.append((name, addr, callee))
-                  if addr in interesting_addrs:
-                      reverse.append((name, addr, interesting_addrs[addr], line.strip()))
-
+                  if addr in interesting:
+                      reverse.append((name, addr, interesting[addr], line.strip()))
           Path('audit/output/reverse-callers.txt').write_text(''.join(
               f'{caller}\t=> 0x{addr:x}\t{callee}\t{line}\n'
               for caller,addr,callee,line in reverse
           ))
 
-          # 从 onInit/onRequest 的直接被调函数继续展开一层，帮助识别实际执行器/解释器。
-          first_level = {addr for caller,addr,callee,line in direct_calls if caller.endswith('onInit') or caller.endswith('onRequest')}
-          second = []
-          ranges_by_start = {s:(s,e,n) for s,e,n,fn in rows}
-          for addr in sorted(first_level):
-              row = ranges_by_start.get(addr)
-              if row is None:
-                  continue
-              start,end,name = row
-              try:
-                  asm = subprocess.check_output([
-                      'objdump','-d','-M','intel',f'--start-address=0x{start:x}',f'--stop-address=0x{end:x}',
-                      Path('audit/output/binary-path.txt').read_text().strip()
-                  ], text=True, errors='replace')
-              except subprocess.CalledProcessError:
-                  continue
-              for line in asm.splitlines():
-                  m = call_re.search(line)
-                  if not m:
-                      continue
-                  callee_addr = int(m.group(1),16)
-                  second.append((name,callee_addr,by_start.get(callee_addr,'<unknown>'),line.strip()))
-          Path('audit/output/hook-second-level-calls.txt').write_text(''.join(
-              f'{caller}\t=> 0x{addr:x}\t{callee}\t{line}\n'
-              for caller,addr,callee,line in second
-          ))
-
-          # 高信号源路径/符号名，辅助确认 script build-tag 对应文件和依赖包。
-          high = []
+          # 单独列出 EdgeNode 非 HTTPRequest 的脚本/JS 高信号函数，帮助识别解释器包装层。
+          project_script = []
           for start,end,name,fn in rows:
               blob = json.dumps(fn, ensure_ascii=False)
-              if ('HTTPRequest).onInit' in name or 'HTTPRequest).onRequest' in name or
-                  config_re.search(blob) or engine_re.search(blob)):
-                  paths = sorted(set(re.findall(r'[^"\\\s]+\.go', blob)))
-                  high.append(name + '\n' + ''.join(f'  source: {p}\n' for p in paths[:12]))
-          Path('audit/output/high-signal-metadata.txt').write_text(''.join(high))
+              if 'TeaOSLab/EdgeNode' in blob and re.search(r'(script|javascript|/js/)', blob, re.I):
+                  project_script.append((start,end,name,blob))
+          Path('audit/output/edge-node-script-symbols.txt').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n,blob in project_script[:1200]
+          ))
+          Path('audit/output/edge-node-script-metadata.txt').write_text(''.join(
+              blob + '\n' for s,e,n,blob in project_script[:250]
+          ))
           PY
 
       - name: Build focused runtime audit summary
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           {
             echo '# GoEdge 1.3.9 Plus 脚本请求链精确静态审计'
             echo
@@ -225,35 +226,42 @@ jobs:
             echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
             echo '- 原版 edge-node 未执行。'
             echo
-            echo '## 关键函数范围'
-            cat audit/output/target-ranges.txt
+            echo '## Go module/build info'
+            sed -n '1,260p' audit/output/module-info.txt 2>/dev/null || true
             echo
-            echo '## onInit 直接调用'
-            cat audit/output/onInit-calls.txt
+            echo '## 高信号原始字符串'
+            sed -n '1,260p' audit/output/high-signal-strings.txt 2>/dev/null || true
             echo
-            echo '## onRequest 直接调用'
-            cat audit/output/onRequest-calls.txt
+            echo '## 已保留关键符号'
+            cat audit/output/target-ranges.txt 2>/dev/null || true
             echo
-            echo '## Do 对关键钩子的调用关系'
-            grep -E 'onInit|onRequest|Script(Config|Group|s)' audit/output/Do-calls.txt || true
+            echo '## 未保留为独立函数的目标'
+            cat audit/output/missing-targets.txt 2>/dev/null || true
             echo
-            echo '## HTTPRequest 内反向调用者'
-            cat audit/output/reverse-callers.txt
+            echo '## 近似钩子符号'
+            cat audit/output/near-hook-symbols.txt 2>/dev/null || true
             echo
-            echo '## 钩子下一层调用'
-            sed -n '1,320p' audit/output/hook-second-level-calls.txt
+            echo '## Do 直接调用序列'
+            sed -n '1,360p' audit/output/Do-calls.txt 2>/dev/null || true
+            echo
+            echo '## doBegin 直接调用序列'
+            sed -n '1,360p' audit/output/doBegin-calls.txt 2>/dev/null || true
             echo
             echo '## 脚本配置符号'
-            cat audit/output/script-config-symbols.txt
+            cat audit/output/script-config-symbols.txt 2>/dev/null || true
             echo
-            echo '## 可能解释器符号（仅候选，不据此猜行为）'
-            sed -n '1,240p' audit/output/engine-symbols.txt
+            echo '## 解释器候选符号'
+            sed -n '1,320p' audit/output/engine-symbols.txt 2>/dev/null || true
             echo
-            echo '## 高信号元数据 / 源路径'
-            sed -n '1,320p' audit/output/high-signal-metadata.txt
+            echo '## EdgeNode 脚本高信号符号'
+            sed -n '1,360p' audit/output/edge-node-script-symbols.txt 2>/dev/null || true
+            echo
+            echo '## 源路径元数据命中'
+            sed -n '1,260p' audit/output/source-path-hits.txt 2>/dev/null || true
+            echo
+            echo '## 反向调用者'
+            sed -n '1,320p' audit/output/reverse-callers.txt 2>/dev/null || true
           } > audit/output/summary.md
-
-          echo '=== Phase A focused scripts runtime audit ==='
           cat audit/output/summary.md
 
       - name: Upload focused scripts runtime audit
