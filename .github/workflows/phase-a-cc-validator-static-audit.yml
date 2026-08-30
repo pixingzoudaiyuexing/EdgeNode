@@ -84,20 +84,15 @@ jobs:
 
           out = []
           for addr in refs:
-              matches = []
               for start, text in entries:
                   raw_len = len(text.encode('utf-8', errors='ignore'))
                   if start <= addr < start + max(raw_len, 1):
-                      matches.append((start, text))
-              if matches:
-                  for start, text in matches:
                       safe = text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                       out.append(f'0x{addr:x}\t0x{start:x}\t{safe}\n')
-
           Path('audit/output/doCC-referenced-strings.txt').write_text(''.join(out))
 
           focus = []
-          needles = ('cc', 'validator', 'redirect', 'key', 'finger', 'global', 'request', 'block')
+          needles = ('cc', 'validator', 'redirect', 'key', 'finger', 'global', 'request', 'block', 'cookie')
           for start, text in entries:
               low = text.lower()
               if any(n in low for n in needles) and len(text) <= 300:
@@ -106,7 +101,101 @@ jobs:
           Path('audit/output/focused-go-strings.txt').write_text(''.join(focus))
           PY
 
-          rm -f audit/goresym-strings.json audit/doCC-objdump.txt
+          rm -f audit/doCC-objdump.txt
+
+      - name: Recover checkCCRedirects function body and call graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+
+          audit/tools/goresym -d "${BIN}" > audit/goresym-functions.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('audit/goresym-functions.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+
+          def n(v):
+              return int(v, 0) if isinstance(v, str) else int(v or 0)
+
+          rows = []
+          target = None
+          for fn in funcs:
+              name = fn.get('FullName') or ''
+              start, end = n(fn.get('Start', 0)), n(fn.get('End', 0))
+              if any(word in name.lower() for word in ('ccredirect', 'validator', 'docc')):
+                  rows.append((start, end, name))
+              if name.endswith('(*HTTPRequest).checkCCRedirects'):
+                  target = (start, end, name)
+
+          rows.sort()
+          Path('audit/output/validator-related-functions.txt').write_text(
+              ''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in rows)
+          )
+          if target is None:
+              raise SystemExit('未找到 (*HTTPRequest).checkCCRedirects')
+          s, e, name = target
+          if not s or e <= s:
+              raise SystemExit(f'checkCCRedirects 地址范围无效: {target!r}')
+          Path('audit/output/checkCCRedirects-range.txt').write_text(
+              f'0x{s:x}\t0x{e:x}\t{name}\n'
+          )
+          PY
+
+          read -r START END NAME < audit/output/checkCCRedirects-range.txt
+          objdump -d -M intel --start-address="${START}" --stop-address="${END}" "${BIN}" \
+            > audit/output/checkCCRedirects-objdump.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          def n(v):
+              return int(v, 0) if isinstance(v, str) else int(v or 0)
+
+          funcs_data = json.loads(Path('audit/goresym-functions.json').read_text())
+          funcs = list(funcs_data.get('UserFunctions') or []) + list(funcs_data.get('StdFunctions') or [])
+          by_start = {}
+          for fn in funcs:
+              start = n(fn.get('Start', 0))
+              if start:
+                  by_start[start] = fn.get('FullName') or ''
+
+          strings_data = json.loads(Path('audit/goresym-strings.json').read_text())
+          strings = []
+          for item in strings_data.get('Strings') or []:
+              start = n(item.get('Start', 0))
+              text = item.get('Str') or ''
+              strings.append((start, text))
+          strings.sort()
+
+          asm = Path('audit/output/checkCCRedirects-objdump.txt').read_text(errors='replace')
+
+          calls = []
+          for line in asm.splitlines():
+              m = re.search(r'\bcall\s+([0-9a-f]+)', line, re.I)
+              if not m:
+                  continue
+              addr = int(m.group(1), 16)
+              calls.append(f'0x{addr:x}\t{by_start.get(addr, "<unknown>")}\t{line.strip()}\n')
+          Path('audit/output/checkCCRedirects-calls.txt').write_text(''.join(calls))
+
+          refs = sorted({int(x, 16) for x in re.findall(r'#\s+0x([0-9a-f]+)', asm, re.I)})
+          out = []
+          for addr in refs:
+              for start, text in strings:
+                  raw_len = len(text.encode('utf-8', errors='ignore'))
+                  if start <= addr < start + max(raw_len, 1):
+                      safe = text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                      out.append(f'0x{addr:x}\t0x{start:x}\t{safe}\n')
+          Path('audit/output/checkCCRedirects-referenced-strings.txt').write_text(''.join(out))
+          PY
+
+          rm -f audit/goresym-functions.json audit/goresym-strings.json
 
       - name: Locate original escalation FixedMap initialization
         shell: bash
@@ -114,35 +203,9 @@ jobs:
           set -euo pipefail
           BIN="$(cat audit/output/binary-path.txt)"
 
-          # increaseCCCounter() 可信反汇编中使用的全局 FixedMap 指针地址为 0x52f3198。
-          # 全量反汇编只在管道中流过，artifact 仅保存命中地址附近上下文。
           objdump -d -M intel "${BIN}" | \
             grep -B 16 -A 20 -E '# 0x52f3198([[:space:]]|$)' \
             > audit/output/escalation-map-xrefs.txt || true
-
-          # 同时把 NewFixedMap 相关 Go 函数名和地址筛出来，便于映射初始化调用。
-          audit/tools/goresym -d "${BIN}" > audit/goresym-functions.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          data = json.loads(Path('audit/goresym-functions.json').read_text())
-          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
-          out = []
-          for fn in funcs:
-              name = fn.get('FullName') or ''
-              if 'FixedMap' not in name and 'init' not in name.lower():
-                  continue
-              start = fn.get('Start', 0)
-              end = fn.get('End', 0)
-              def n(v):
-                  return int(v, 0) if isinstance(v, str) else int(v or 0)
-              out.append((n(start), n(end), name))
-          out.sort()
-          Path('audit/output/fixedmap-init-functions.txt').write_text(
-              ''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in out)
-          )
-          PY
-          rm -f audit/goresym-functions.json
 
       - name: Build validator audit summary
         shell: bash
@@ -155,11 +218,20 @@ jobs:
             echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
             echo '- 原版 edge-node 未执行。'
             echo
+            echo '## checkCCRedirects 地址范围'
+            cat audit/output/checkCCRedirects-range.txt 2>/dev/null || true
+            echo
+            echo '## checkCCRedirects 直接调用'
+            cat audit/output/checkCCRedirects-calls.txt 2>/dev/null || true
+            echo
+            echo '## checkCCRedirects 引用字符串'
+            cat audit/output/checkCCRedirects-referenced-strings.txt 2>/dev/null || true
+            echo
+            echo '## Validator 相关函数'
+            cat audit/output/validator-related-functions.txt 2>/dev/null || true
+            echo
             echo '## doCC 引用字符串映射'
             cat audit/output/doCC-referenced-strings.txt 2>/dev/null || true
-            echo
-            echo '## escalation FixedMap 全局引用'
-            cat audit/output/escalation-map-xrefs.txt 2>/dev/null || true
           } > audit/output/summary.md
 
       - name: Upload validator static audit text
