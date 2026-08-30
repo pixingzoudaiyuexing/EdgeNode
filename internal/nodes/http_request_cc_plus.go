@@ -29,13 +29,11 @@ const (
 //   - 节点自动白名单、系统 IP 名单和 CC 临时黑名单的原版检查顺序；
 //   - URL/常见静态文件/MinQPSPerIP 过滤；
 //   - 单 IP 最大连接数检查，默认 30，count >= limit 时触发 403；
+//   - GET302 浏览器校验、600 秒临时权限和连续无效跳转封禁；
 //   - 来源 IP + 可选 HTTPS 指纹的多周期阈值统计；
 //   - count >= MaxRequests 时第 N 次请求立即触发 429；
-//   - 两类封禁共用按客户端 IP 计算的 24 小时、最高 32 倍重复封禁递增；
+//   - 429/403 请求封禁共用按客户端 IP 计算的 24 小时、最高 32 倍重复封禁递增；
 //   - FirewallScope、临时黑名单、本机防火墙范围，以及请求阈值的 CCProtection 标签/攻击标记。
-//
-// GET302 validator 仍由后续独立阶段接入，避免把尚未完整验证的浏览器重定向协议
-// 混进已经可以逐项验收的连接限制和普通请求阈值路径。
 func (this *HTTPRequest) doCC() (block bool) {
 	if this == nil || this.RawReq == nil || this.web == nil || this.web.CC == nil || !this.web.CC.IsOn {
 		return false
@@ -127,6 +125,12 @@ func (this *HTTPRequest) doCC() (block bool) {
 		)
 		// 原版此分支不追加 CCProtection/isAttack，也不额外调用 HTTPRequest.Close()；
 		// RecordIP() 会关闭该 IP 当前所有已登记连接。
+		return true
+	}
+
+	// 可信 1.3.9 Plus 控制流确认：GET302 位于单 IP 连接限制之后、普通请求阈值之前。
+	// GET302 已处理当前请求时立即返回；已有临时权限或属于跳过对象时继续执行后续阈值。
+	if this.doCCGET302(config, policy, remoteAddr, firewallScope) {
 		return true
 	}
 
