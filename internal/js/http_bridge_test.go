@@ -159,8 +159,11 @@ func TestHTTPRequestBridgeProtocol(t *testing.T) {
 	if _, ok := req.setVar["X-Via-SetVar"]; ok {
 		t.Fatal("prototype setVar must not call RequestInterface.SetVar in 1.3.9")
 	}
-	if got := req.header.Get("X-Via-SetVar"); got != "compat" {
-		t.Fatalf("setVar compatibility header = %q", got)
+	if req.lastSetName != "X-Via-SetVar" || len(req.lastSetValue) != 1 || req.lastSetValue[0] != "compat" {
+		t.Fatalf("setVar compatibility SetHeader call = %q %#v", req.lastSetName, req.lastSetValue)
+	}
+	if got := req.header["X-Via-SetVar"]; len(got) != 1 || got[0] != "compat" {
+		t.Fatalf("setVar exact header entry = %#v", got)
 	}
 }
 
