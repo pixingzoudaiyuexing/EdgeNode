@@ -40,36 +40,34 @@ jobs:
 
           path=Path('audit/output/binary-path.txt').read_text().strip()
           data=Path(path).read_bytes()
-          anchor=b'gojs.prepareNamespace = function (ns) {'
-          start=data.find(anchor)
-          if start < 0:
-              raise SystemExit('prepareNamespace anchor missing')
-          lo=max(0,start-2048)
-          hi=min(len(data),start+4096)
+          prepare=data.find(b'gojs.prepareNamespace = function (ns) {')
+          once=data.find(b'gojs.once = function (f) {')
+          if prepare < 0 or once < 0:
+              raise SystemExit('bootstrap anchors missing')
+          lo=max(0,prepare-2048)
+          hi=min(len(data),once+2048)
           region=data[lo:hi]
 
-          checks=[]
-          # 只恢复声明形态，不保存整段私有 JS 源码。
-          patterns={
-              'gojs_empty_object': rb'(?:var|let|const)?\s*gojs\s*=\s*\{\s*\}',
-              'callbacks_empty_array': rb'(?:var|let|const)\s+callbacks\s*=\s*\[\s*\]',
+          specs={
+              'gojs_empty_object': (rb'(?:var|let|const)?\s*gojs\s*=\s*\{\s*\}', 'before_prepare'),
+              'callbacks_empty_array': (rb'(?:var|let|const)\s+callbacks\s*=\s*\[\s*\]', 'before_once'),
           }
-          for name,pat in patterns.items():
+          out=[]
+          for name,(pat,rule) in specs.items():
               matches=list(re.finditer(pat,region,re.S))
               if len(matches) != 1:
                   raise SystemExit(f'{name}: expected exactly one nearby declaration, got {len(matches)}')
               m=matches[0]
+              off=lo+m.start()
+              if rule == 'before_prepare' and off >= prepare:
+                  raise SystemExit('gojs declaration must precede prepareNamespace')
+              if rule == 'before_once' and off >= once:
+                  raise SystemExit('callbacks declaration must precede once')
               text=m.group(0).decode('utf-8')
-              checks.append(f'{name}=PASS\toffset=0x{lo+m.start():x}\tdeclaration={text!r}\n')
+              out.append(f'{name}=PASS\toffset=0x{off:x}\tdeclaration={text!r}\n')
 
-          # 声明必须位于 prepareNamespace 之前；否则不能作为 bootstrap 初始化依据。
-          for line in checks:
-              off=int(re.search(r'offset=0x([0-9a-f]+)',line).group(1),16)
-              if off >= start:
-                  raise SystemExit('bootstrap declaration appears after prepareNamespace')
-
-          Path('audit/output/summary.txt').write_text(''.join(checks))
-          print(''.join(checks),end='')
+          Path('audit/output/summary.txt').write_text(''.join(out))
+          print(''.join(out),end='')
           PY
 
       - name: Upload declaration evidence
