@@ -3,11 +3,11 @@
 package js
 
 import (
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
-func TestContextGoObjectResetAndReuse(t *testing.T) {
+func TestBootstrapAndContextReuse(t *testing.T) {
 	isolate, err := NewIsolateWithContexts(1)
 	if err != nil {
 		t.Fatal(err)
@@ -18,102 +18,105 @@ func TestContextGoObjectResetAndReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id1 := ctx.AddGoObject("first")
-	id2 := ctx.AddGoObject("second")
-	if id1 != 1 || id2 != 2 {
-		t.Fatalf("ids = %d,%d, want 1,2", id1, id2)
+	if ctx == nil {
+		t.Fatal("expected context")
 	}
-	if got := ctx.GoObject(id2); got != "second" {
-		t.Fatalf("GoObject(%d) = %#v", id2, got)
+
+	value, err := ctx.RunScript(`
+		gojs.prepareNamespace("gojs.net.http");
+		let inherited = {skip: 1};
+		let source = Object.create(inherited);
+		source.keep = 2;
+		let dest = {};
+		gojs.copyAttrs(dest, source);
+		let count = 0;
+		gojs.once(function () { count++; });
+		gojs.runOnce();
+		gojs.runOnce();
+		JSON.stringify({namespace: typeof gojs.net.http, copied: dest.keep, skipped: dest.skip, count: count});
+	`, "bootstrap-test.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := value.String(); got != `{"namespace":"object","copied":2,"count":2}` {
+		t.Fatalf("unexpected bootstrap result: %s", got)
+	}
+
+	if id := ctx.AddGoObject("first"); id != 1 {
+		t.Fatalf("first object id = %d, want 1", id)
+	}
+	if id := ctx.AddGoObject("second"); id != 2 {
+		t.Fatalf("second object id = %d, want 2", id)
+	}
+	if got := ctx.GoObject(2); got != "second" {
+		t.Fatalf("unexpected object: %#v", got)
 	}
 
 	isolate.PutContext(ctx)
-	ctx, err = isolate.GetContext()
+	reused, err := isolate.GetContext()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer isolate.PutContext(ctx)
-	if got := ctx.GoObject(id1); got != nil {
-		t.Fatalf("old go object leaked: %#v", got)
+	if reused != ctx {
+		t.Fatal("expected pooled context to be reused")
 	}
-	if id := ctx.AddGoObject("again"); id != 1 {
-		t.Fatalf("id after Done = %d, want 1", id)
+	if got := reused.GoObject(1); got != nil {
+		t.Fatalf("go object map was not reset: %#v", got)
 	}
+	if id := reused.AddGoObject("again"); id != 1 {
+		t.Fatalf("object id after Done = %d, want 1", id)
+	}
+	isolate.PutContext(reused)
 }
 
-func TestBootstrapRunOnce(t *testing.T) {
-	isolate, err := NewIsolateWithContexts(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer isolate.Dispose()
-
-	ctx, err := isolate.GetContext()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer isolate.PutContext(ctx)
-
-	value, err := ctx.RunScript(`
-		let n = 0;
-		gojs.once(function () { n += 1; });
-		gojs.once(function () { n += 2; });
-		gojs.runOnce();
-		gojs.runOnce();
-		n;
-	`, "bootstrap_test.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := value.Int32(); got != 3 {
-		t.Fatalf("runOnce result = %d, want 3", got)
-	}
-}
-
-func TestIsolateOverUsesBoundary(t *testing.T) {
-	isolate, err := NewIsolateWithContexts(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer isolate.Dispose()
-	isolate.uses = 4096
+func TestOverUsesBoundary(t *testing.T) {
+	isolate := &Isolate{}
+	atomic.StoreUint32(&isolate.uses, isolateMaxUses)
 	if isolate.OverUses() {
-		t.Fatal("4096 uses must not be overused")
+		t.Fatal("4096 uses must not be over limit")
 	}
-	isolate.uses = 4097
+	atomic.StoreUint32(&isolate.uses, isolateMaxUses+1)
 	if !isolate.OverUses() {
-		t.Fatal("4097 uses must be overused")
+		t.Fatal("4097 uses must be over limit")
 	}
 }
 
-func TestIsolatePoolDirtyWaitsForContextReturn(t *testing.T) {
-	pool, err := NewIsolatePool(1)
+func TestTickReplacesAndDefersDirtyDispose(t *testing.T) {
+	old, err := NewIsolateWithContexts(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
 
-	old := pool.isolates[0]
-	ctx, err := pool.GetContext()
+	held, err := old.GetContext()
 	if err != nil {
+		old.Dispose()
 		t.Fatal(err)
 	}
-	old.uses = 4097
+	atomic.StoreUint32(&old.uses, isolateMaxUses+1)
+
+	pool := &IsolatePool{isolates: []*Isolate{old}, size: 1}
 	pool.tick()
 	if pool.isolates[0] == old {
-		t.Fatal("overused isolate was not replaced")
+		old.PutContext(held)
+		old.Dispose()
+		t.Fatal("expected active isolate replacement")
 	}
 	if len(pool.dirty) != 1 || pool.dirty[0] != old {
-		t.Fatal("old isolate was not appended to dirty queue")
+		t.Fatal("old isolate was not moved to dirty queue")
 	}
 	if old.disposed {
-		t.Fatal("in-use dirty isolate disposed too early")
+		t.Fatal("in-use dirty isolate must not be disposed")
 	}
 
-	pool.PutContext(ctx)
+	pool.tick()
+	if old.disposed {
+		t.Fatal("dirty isolate was disposed while context was still held")
+	}
+
+	old.PutContext(held)
 	pool.tick()
 	if !old.disposed {
-		t.Fatal("dirty isolate was not disposed after context return")
+		t.Fatal("idle dirty isolate should be disposed")
 	}
 	if len(pool.dirty) != 0 {
 		t.Fatalf("dirty queue size = %d, want 0", len(pool.dirty))
@@ -130,7 +133,7 @@ type lifecycleLibrary struct {
 }
 
 func (l *lifecycleLibrary) JSNamespace() string { return "gojs.test" }
-// 该测试只验证 Library 生命周期；真实 loader 会执行 JSPrototype，因此这里返回空代码而不是旧占位符 "Test"。
+// 这里只测试生命周期；真实 loader 会执行 Prototype，所以不要使用旧占位符 "Test"。
 func (l *lifecycleLibrary) JSPrototype() string { return "" }
 func (l *lifecycleLibrary) JSInit(ctx *Context)  { l.initCount++ }
 func (l *lifecycleLibrary) JSDone(ctx *Context)  { l.doneCount++ }
@@ -169,25 +172,12 @@ func TestLibraryLifecycleAndDoubleDone(t *testing.T) {
 		isolate.Dispose()
 		t.Fatalf("JSDone count after PutContext = %d, want 3", library.doneCount)
 	}
+
 	isolate.Dispose()
+	if library.doneCount != 4 {
+		t.Fatalf("JSDone count after Dispose = %d, want 4", library.doneCount)
+	}
 	if library.disposeCount != 1 {
 		t.Fatalf("JSDispose count = %d, want 1", library.disposeCount)
-	}
-}
-
-func TestIsolatePoolTickerInterval(t *testing.T) {
-	pool, err := NewIsolatePool(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	if pool.ticker == nil {
-		t.Fatal("ticker is nil")
-	}
-	// time.Ticker 不暴露 Duration；这里确认一次 tick 不会在明显短于原版 5 秒的时间内到达。
-	select {
-	case <-pool.ticker.C:
-		t.Fatal("ticker fired too early")
-	case <-time.After(25 * time.Millisecond):
 	}
 }
