@@ -64,8 +64,17 @@ jobs:
           # 只编译和链接测试二进制，绝不运行 V8；用于验证 upstream 0.8.0 是否具备原版核心 API/静态库。
           go test -c -o /tmp/v8go-compat.test .
           test -s /tmp/v8go-compat.test
-          go version -m /tmp/v8go-compat.test | tee /tmp/v8go-build-info.txt
-          grep -F $'dep\trogchap.com/v8go\tv0.8.0' /tmp/v8go-build-info.txt
+
+          # go version -m 对 go test -c 生成的测试二进制不稳定地省略 module build-info，
+          # 因此依赖版本证据改为直接保存临时 module 的解析结果；编译/链接成功仍由上一条命令保证。
+          go list -m all | tee /tmp/v8go-modules.txt
+          grep -Fx 'rogchap.com/v8go v0.8.0' /tmp/v8go-modules.txt
+          {
+            echo "go=$(go version)"
+            echo "binary=$(file /tmp/v8go-compat.test)"
+            echo
+            cat /tmp/v8go-modules.txt
+          } > /tmp/v8go-build-info.txt
 
       - name: Upload compatibility evidence
         uses: actions/upload-artifact@v4
