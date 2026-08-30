@@ -1,0 +1,70 @@
+name: Phase A Scripts Core Verify
+
+on:
+  push:
+    branches:
+      - phase-a-scripts-core
+    paths:
+      - "internal/js/**"
+      - "internal/utils/mem/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/phase-a-scripts-core-verify.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-scripts-core:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout EdgeCommon
+        uses: actions/checkout@v4
+        with:
+          repository: pixingzoudaiyuexing/EdgeCommon
+          ref: main
+          path: EdgeCommon
+
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+        with:
+          path: EdgeNode
+
+      - name: Setup Go 1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+          cache-dependency-path: EdgeNode/go.sum
+
+      - name: Lock v8go checksum
+        working-directory: EdgeNode
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download rogchap.com/v8go@v0.8.0
+          grep -F 'rogchap.com/v8go v0.8.0 h1:/crDEiga68kOtbIqw3K9Rt9OztYz0LhAPHm2e3wK7Q4=' go.sum
+          grep -F 'rogchap.com/v8go v0.8.0/go.mod h1:MxgP3pL2MW4dpme/72QRs8sgNMmM0pRc8DPhcuLWPAs=' go.sum
+
+      - name: Test Scripts-1 real V8 lifecycle
+        working-directory: EdgeNode
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 -tags script ./internal/js
+          go test -count=1 ./internal/utils/mem
+
+      - name: Ensure go.mod remains stable
+        working-directory: EdgeNode
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- go.mod
+
+      - name: Upload generated go.sum
+        uses: actions/upload-artifact@v4
+        with:
+          name: scripts-core-go-sum
+          path: EdgeNode/go.sum
+          if-no-files-found: error
+          retention-days: 7
