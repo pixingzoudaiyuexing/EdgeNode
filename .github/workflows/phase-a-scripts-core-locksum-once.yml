@@ -1,0 +1,54 @@
+name: Phase A Scripts Core Lock Sum Once
+
+on:
+  push:
+    branches:
+      - phase-a-scripts-core
+    paths:
+      - ".github/workflows/phase-a-scripts-core-locksum-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  lock-go-sum:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout EdgeCommon
+        uses: actions/checkout@v4
+        with:
+          repository: pixingzoudaiyuexing/EdgeCommon
+          ref: main
+          path: EdgeCommon
+
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+        with:
+          ref: phase-a-scripts-core
+          path: EdgeNode
+
+      - name: Setup Go 1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+          cache: false
+
+      - name: Generate and commit exact v8go checksum
+        working-directory: EdgeNode
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download rogchap.com/v8go@v0.8.0
+          grep -F 'rogchap.com/v8go v0.8.0 h1:/crDEiga68kOtbIqw3K9Rt9OztYz0LhAPHm2e3wK7Q4=' go.sum
+          grep -F 'rogchap.com/v8go v0.8.0/go.mod h1:MxgP3pL2MW4dpme/72QRs8sgNMmM0pRc8DPhcuLWPAs=' go.sum
+
+          git add go.sum
+          if git diff --cached --quiet; then
+            echo 'go.sum already locked'
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'build: 锁定 v8go 依赖校验和'
+          git push origin HEAD:phase-a-scripts-core
