@@ -1,67 +1,23 @@
-// Copyright 2021 GoEdge goedge.cdn@gmail.com. All rights reserved.
+package mem
 
-package memutils
+import gopsutilmem "github.com/shirou/gopsutil/v3/mem"
 
-import (
-	teaconst "github.com/TeaOSLab/EdgeNode/internal/const"
-	"github.com/TeaOSLab/EdgeNode/internal/utils/goman"
-	"github.com/shirou/gopsutil/v3/mem"
-	"time"
-)
-
-var systemTotalMemory = -1
-var systemMemoryBytes uint64
-var availableMemoryGB int
+var systemTotalMemoryGB = -1
 
 func init() {
-	if !teaconst.IsMain {
-		return
-	}
-
 	_ = SystemMemoryGB()
-
-	goman.New(func() {
-		var ticker = time.NewTicker(10 * time.Second)
-		for range ticker.C {
-			stat, err := mem.VirtualMemory()
-			if err == nil {
-				availableMemoryGB = int(stat.Available >> 30)
-			}
-		}
-	})
 }
 
-// SystemMemoryGB 系统内存GB数量
-// 必须保证不小于1
+// SystemMemoryGB 返回物理内存总量的 GiB 整数部分，并缓存首次成功结果。
+// 该换算方式与 GoEdge 1.3.9 同代实现保持一致。
 func SystemMemoryGB() int {
-	if systemTotalMemory > 0 {
-		return systemTotalMemory
+	if systemTotalMemoryGB > 0 {
+		return systemTotalMemoryGB
 	}
-
-	stat, err := mem.VirtualMemory()
+	stat, err := gopsutilmem.VirtualMemory()
 	if err != nil {
-		return 1
+		return 0
 	}
-
-	systemMemoryBytes = stat.Total
-
-	availableMemoryGB = int(stat.Available >> 30)
-	systemTotalMemory = int(stat.Total >> 30)
-	if systemTotalMemory <= 0 {
-		systemTotalMemory = 1
-	}
-
-	setMaxMemory(systemTotalMemory)
-
-	return systemTotalMemory
-}
-
-// SystemMemoryBytes 系统内存总字节数
-func SystemMemoryBytes() uint64 {
-	return systemMemoryBytes
-}
-
-// AvailableMemoryGB 获取当下可用内存GB数
-func AvailableMemoryGB() int {
-	return availableMemoryGB
+	systemTotalMemoryGB = int(stat.Total / 1024 / 1024 / 1024)
+	return systemTotalMemoryGB
 }
