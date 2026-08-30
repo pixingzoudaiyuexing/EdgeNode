@@ -3,6 +3,7 @@ name: Phase A Scripts HTTP Bridge Verify
 on:
   push:
     branches:
+      - master
       - phase-a-scripts-http-bridge
     paths:
       - "internal/js/**"
