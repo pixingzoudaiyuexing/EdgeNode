@@ -169,26 +169,13 @@ func (this *HTTPRequest) checkCCRedirects(policy *nodeconfigs.HTTPCCPolicy, remo
 }
 
 func ccGET302RedirectConfig(policy *nodeconfigs.HTTPCCPolicy) (validatePath string, durationSeconds int, maxRedirects int, blockSeconds int) {
-	validatePath = edgecc.RedirectsValidatePath
-	durationSeconds = edgecc.RedirectsDurationSeconds
-	maxRedirects = edgecc.RedirectsMaxRedirects
-	blockSeconds = edgecc.RedirectsBlockSeconds
-	if policy == nil {
-		return
-	}
-
-	redirects := policy.RedirectsChecking
-	if len(redirects.ValidatePath) > 0 {
-		validatePath = redirects.ValidatePath
-	}
-	if redirects.DurationSeconds > 0 {
-		durationSeconds = redirects.DurationSeconds
-	}
-	if redirects.MaxRedirects > 0 {
-		maxRedirects = redirects.MaxRedirects
-	}
-	if redirects.BlockSeconds > 0 {
-		blockSeconds = redirects.BlockSeconds
+	validatePath = nodeconfigs.DefaultHTTPCCPolicyRedirectsCheckingValidatePath
+	limits := edgecc.ResolveRedirectLimits(policy)
+	durationSeconds = limits.DurationSeconds
+	maxRedirects = limits.MaxRedirects
+	blockSeconds = limits.BlockSeconds
+	if policy != nil && len(policy.RedirectsChecking.ValidatePath) > 0 {
+		validatePath = policy.RedirectsChecking.ValidatePath
 	}
 	return
 }
