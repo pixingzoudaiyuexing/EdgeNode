@@ -43,11 +43,10 @@ func (c *Context) loadLibraries() error {
 	if _, err := c.rawContext.RunScript(bootstrapSource, "utils.js"); err != nil {
 		return err
 	}
-
-	// 原版会在这里继续完成 Namespace/Prototype/Go 方法注入。
-	// Scripts-1 只恢复公共生命周期骨架；当前尚未注册具体 Library。
 	for _, library := range SharedLibraryManager.All() {
-		library.JSInit(c)
+		if err := c.installLibrary(library); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -72,6 +71,11 @@ func (c *Context) AddGoObject(object any) uint32 {
 	c.goObjectLocker.Unlock()
 	return id
 }
+
+// AddGoRequestObject / AddGoResponseObject 在 1.3.9 Plus 中都是 AddGoObject 的薄封装；
+// Request 与 Response 共享同一套 Context 级 Go Object ID 空间。
+func (c *Context) AddGoRequestObject(object RequestInterface) uint32 { return c.AddGoObject(object) }
+func (c *Context) AddGoResponseObject(object ResponseInterface) uint32 { return c.AddGoObject(object) }
 
 func (c *Context) GoObject(id uint32) any {
 	c.goObjectLocker.RLock()
