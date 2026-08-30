@@ -3,6 +3,7 @@ name: Phase A Scripts Core Verify
 on:
   push:
     branches:
+      - master
       - phase-a-scripts-core
     paths:
       - "internal/js/**"
