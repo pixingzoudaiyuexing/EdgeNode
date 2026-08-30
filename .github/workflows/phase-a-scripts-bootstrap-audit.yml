@@ -41,36 +41,60 @@ jobs:
           path=Path('audit/output/binary-path.txt').read_text().strip()
           data=Path(path).read_bytes()
 
-          # 这些地址来自 `strings -a -t x`，因此是文件偏移，不是 ELF 虚拟地址。
-          def cstr(off,limit=4096):
-              if off < 0 or off >= len(data):
-                  raise SystemExit(f'offset 0x{off:x} outside file')
-              end=min(len(data),off+limit)
-              nul=data.find(b'\x00',off,end)
-              if nul < 0:
-                  raise SystemExit(f'no NUL for file offset 0x{off:x}')
-              return data[off:nul]
-
-          funcs={
-              'prepareNamespace':0x2d2b300,
-              'copyAttrs':0x2d2b431,
-              'once':0x2d2b547,
-              'runOnce':0x2d2b5a2,
-          }
-          expected_prefixes={
+          prefixes={
               'prepareNamespace':b'gojs.prepareNamespace = function (ns) {',
               'copyAttrs':b'gojs.copyAttrs = function (destObj, srcObj) {',
-              'once':b'\tgojs.once = function (f) {',
-              'runOnce':b'\tgojs.runOnce = function () {',
+              'once':b'gojs.once = function (f) {',
+              'runOnce':b'gojs.runOnce = function () {',
           }
+
+          def extract_function(prefix):
+              start=data.find(prefix)
+              if start < 0:
+                  raise SystemExit('prefix not found: '+prefix.decode())
+              # 只在 8 KiB 小窗口内做简单 JS 花括号匹配；四个 bootstrap 函数不含模板字面量。
+              window=data[start:start+8192].decode('utf-8',errors='strict')
+              brace=window.find('{')
+              if brace < 0:
+                  raise SystemExit('opening brace not found')
+              depth=0
+              quote=None
+              escape=False
+              line_comment=False
+              block_comment=False
+              i=brace
+              while i < len(window):
+                  c=window[i]
+                  n=window[i+1] if i+1 < len(window) else ''
+                  if line_comment:
+                      if c == '\n': line_comment=False
+                      i+=1; continue
+                  if block_comment:
+                      if c == '*' and n == '/': block_comment=False; i+=2; continue
+                      i+=1; continue
+                  if quote is not None:
+                      if escape: escape=False
+                      elif c == '\\': escape=True
+                      elif c == quote: quote=None
+                      i+=1; continue
+                  if c in ('"',"'"):
+                      quote=c; i+=1; continue
+                  if c == '/' and n == '/': line_comment=True; i+=2; continue
+                  if c == '/' and n == '*': block_comment=True; i+=2; continue
+                  if c == '{': depth+=1
+                  elif c == '}':
+                      depth-=1
+                      if depth == 0:
+                          return start,window[:i+1]
+                  i+=1
+              raise SystemExit('function closing brace not found in bounded window')
+
           summary=[]
-          for name,off in funcs.items():
-              raw=cstr(off)
-              if not raw.startswith(expected_prefixes[name]):
-                  raise SystemExit(f'{name}: unexpected prefix at file offset 0x{off:x}')
-              text=raw.decode('utf-8')
+          for name,prefix in prefixes.items():
+              off,text=extract_function(prefix)
+              raw=text.encode('utf-8')
               Path(f'audit/output/{name}.js.txt').write_text(text+'\n')
-              summary.append(f'{name}\tlen={len(raw)}\tsha256={hashlib.sha256(raw).hexdigest()}\n')
+              summary.append(f'{name}\toffset=0x{off:x}\tlen={len(raw)}\tsha256={hashlib.sha256(raw).hexdigest()}\n')
           Path('audit/output/summary.txt').write_text(''.join(summary))
           print(''.join(summary),end='')
           PY
