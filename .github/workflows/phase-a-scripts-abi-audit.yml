@@ -1,0 +1,243 @@
+name: Phase A Scripts ABI Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-scripts-abi-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-scripts-abi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Build pinned GoReSym
+        working-directory: audit/GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+          mkdir -p ../tools
+          go build -trimpath -o ../tools/goresym .
+
+      - name: Download and verify trusted 1.3.9 Plus archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Recover script ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          audit/tools/goresym -d "${BIN}" > audit/functions.json
+          readelf -W -l "${BIN}" > audit/program-headers.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          binary_path = Path('audit/output/binary-path.txt').read_text().strip()
+          binary = Path(binary_path).read_bytes()
+          data = json.loads(Path('audit/functions.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+
+          def num(v):
+              return int(v, 0) if isinstance(v, str) else int(v or 0)
+
+          rows = []
+          by_start = {}
+          for fn in funcs:
+              name = fn.get('FullName') or ''
+              start, end = num(fn.get('Start', 0)), num(fn.get('End', 0))
+              if start and end > start:
+                  rows.append((start, end, name, fn))
+                  by_start[start] = name
+          rows.sort()
+
+          js_rows = [(s,e,n,fn) for s,e,n,fn in rows if 'github.com/TeaOSLab/EdgeNode/internal/js' in n]
+          Path('audit/output/internal-js-symbols.txt').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{n}\n' for s,e,n,fn in js_rows
+          ))
+
+          wanted_suffixes = [
+              '(*HTTPRequest).fireScriptEvent',
+              '(*HTTPRequest).runScript',
+              '(*HTTPRequest).runScript.func1',
+              'internal/js.(*Context).RunScript',
+              'internal/js.NewContext',
+              'internal/js.IsSameCommonScripts',
+          ]
+          targets = {}
+          for s,e,n,fn in rows:
+              for suffix in wanted_suffixes:
+                  if n.endswith(suffix):
+                      targets[suffix] = (s,e,n)
+
+          # 同时加入 internal/js 的全部非巨大函数；名字本身就是 ABI 证据。
+          for s,e,n,fn in js_rows:
+              if e-s <= 0x6000:
+                  targets.setdefault(n, (s,e,n))
+
+          Path('audit/output/target-ranges.txt').write_text(''.join(
+              f'0x{s:x}\t0x{e:x}\t{n}\n' for key,(s,e,n) in targets.items()
+          ))
+
+          call_re = re.compile(r'\bcall\s+(?:0x)?([0-9a-f]+)', re.I)
+          addr_ref_re = re.compile(r'#\s+(?:0x)?([0-9a-f]+)', re.I)
+          all_refs = set()
+
+          def safe_name(name):
+              out = re.sub(r'[^A-Za-z0-9_.-]+', '_', name)
+              return out[-160:]
+
+          for key,(start,end,name) in targets.items():
+              asm = subprocess.check_output([
+                  'objdump','-d','-M','intel',f'--start-address=0x{start:x}',f'--stop-address=0x{end:x}',binary_path
+              ], text=True, errors='replace')
+              label = safe_name(name)
+              Path(f'audit/output/{label}.asm.txt').write_text(asm)
+              calls = []
+              for line in asm.splitlines():
+                  m = call_re.search(line)
+                  if m:
+                      addr = int(m.group(1),16)
+                      calls.append(f'0x{addr:x}\t{by_start.get(addr,"<unknown>")}\t{line.strip()}\n')
+                  for x in addr_ref_re.findall(line):
+                      all_refs.add(int(x,16))
+              Path(f'audit/output/{label}.calls.txt').write_text(''.join(calls))
+
+          # 映射 LOAD 段，把目标函数引用到的只读字符串直接读出来。
+          segments=[]
+          for line in Path('audit/program-headers.txt').read_text(errors='replace').splitlines():
+              parts=line.split()
+              if not parts or parts[0] != 'LOAD' or len(parts) < 6:
+                  continue
+              off=int(parts[1],16); va=int(parts[2],16); filesz=int(parts[4],16)
+              segments.append((va,va+filesz,off))
+
+          def file_offset(addr):
+              for va0,va1,off0 in segments:
+                  if va0 <= addr < va1:
+                      return off0 + (addr-va0)
+              return None
+
+          string_hits=[]
+          for addr in sorted(all_refs):
+              off=file_offset(addr)
+              if off is None or off >= len(binary):
+                  continue
+              raw=binary[off:off+192]
+              # 先截到第一个 NUL，避免一条引用吞进大量无关 rodata。
+              chunk=raw.split(b'\x00',1)[0]
+              if len(chunk) < 2:
+                  continue
+              try:
+                  text=chunk.decode('utf-8')
+              except UnicodeDecodeError:
+                  continue
+              printable=sum(1 for c in text if c.isprintable() or c in '\r\n\t')
+              if printable < max(2, int(len(text)*0.85)):
+                  continue
+              string_hits.append(f'0x{addr:x}\t{text[:180].replace(chr(10),"\\n")}\n')
+          Path('audit/output/target-rodata-strings.txt').write_text(''.join(string_hits))
+
+          # 精确定位 fireScriptEvent 的反向调用点，用于恢复事件发生阶段。
+          fire = None
+          for s,e,n,fn in rows:
+              if n.endswith('(*HTTPRequest).fireScriptEvent'):
+                  fire=s
+                  break
+          callers=[]
+          if fire:
+              request_methods=[(s,e,n) for s,e,n,fn in rows if 'EdgeNode/internal/nodes.(*HTTPRequest).' in n]
+              for s,e,n in request_methods:
+                  try:
+                      asm=subprocess.check_output([
+                          'objdump','-d','-M','intel',f'--start-address=0x{s:x}',f'--stop-address=0x{e:x}',binary_path
+                      ], text=True, errors='replace')
+                  except subprocess.CalledProcessError:
+                      continue
+                  lines=asm.splitlines()
+                  for i,line in enumerate(lines):
+                      m=call_re.search(line)
+                      if not m or int(m.group(1),16) != fire:
+                          continue
+                      context='\n'.join(lines[max(0,i-25):min(len(lines),i+18)])
+                      callers.append(f'===== {n} =====\n{context}\n\n')
+          Path('audit/output/fireScriptEvent-call-contexts.txt').write_text(''.join(callers))
+          PY
+
+      - name: Build ABI summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIRE_BASE="github.com_TeaOSLab_EdgeNode_internal_nodes._HTTPRequest_.fireScriptEvent"
+          RUN_BASE="github.com_TeaOSLab_EdgeNode_internal_nodes._HTTPRequest_.runScript"
+          JS_BASE="github.com_TeaOSLab_EdgeNode_internal_js._Context_.RunScript"
+          {
+            echo '# GoEdge 1.3.9 Plus 脚本执行 ABI 静态审计'
+            echo
+            echo '- ZIP MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
+            echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
+            echo '- 原版 edge-node 未执行。'
+            echo
+            echo '## internal/js 全部符号'
+            cat audit/output/internal-js-symbols.txt
+            echo
+            echo '## fireScriptEvent 调用'
+            cat "audit/output/${FIRE_BASE}.calls.txt" 2>/dev/null || true
+            echo
+            echo '## runScript 调用'
+            cat "audit/output/${RUN_BASE}.calls.txt" 2>/dev/null || true
+            echo
+            echo '## internal/js Context.RunScript 调用'
+            cat "audit/output/${JS_BASE}.calls.txt" 2>/dev/null || true
+            echo
+            echo '## 目标代码引用字符串'
+            sed -n '1,500p' audit/output/target-rodata-strings.txt
+            echo
+            echo '## fireScriptEvent 所有 HTTPRequest 调用现场'
+            sed -n '1,900p' audit/output/fireScriptEvent-call-contexts.txt
+          } > audit/output/summary.md
+          cat audit/output/summary.md
+
+      - name: Upload scripts ABI audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-scripts-abi-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
