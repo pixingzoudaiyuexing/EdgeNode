@@ -129,7 +129,7 @@ func TestHTTPRequestBridgeProtocol(t *testing.T) {
 		JSON.stringify({
 			id:req.id, requestId:req.requestId, url:req.url, path:req.path, uri:req.uri,
 			host:req.host, remoteAddr:req.remoteAddr, rawRemoteAddr:req.rawRemoteAddr,
-			remotePort:req.remotePort, method:req.method, contentLength:req.contentLength,
+			remotePort:req.remotePort, method:req.method, contentLength:Number(req.contentLength),
 			transferEncoding:req.transferEncoding, proto:req.proto, protoMajor:req.protoMajor,
 			protoMinor:req.protoMinor, cookie:req.cookie("sid"), formatted:req.format(5),
 			server:req.server.id, node:req.node.id, header:req.header["X-Initial"]
@@ -220,7 +220,7 @@ func TestHTTPBridgeErrors(t *testing.T) {
 		t.Fatalf("redirect error = %v", err)
 	}
 
-	_, err = ctx.RunScript(`let req = new gojs.net.http.Request(); req.setGoObject(999999); req.id;`, "missing-object.js")
+	_, err = ctx.RunScript(`let missingReq = new gojs.net.http.Request(); missingReq.setGoObject(999999); missingReq.id;`, "missing-object.js")
 	if err == nil || !strings.Contains(err.Error(), "go object not found") {
 		t.Fatalf("missing object error = %v", err)
 	}
