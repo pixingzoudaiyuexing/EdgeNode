@@ -1,0 +1,229 @@
+name: Phase A CC Legacy Fields Audit
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-cc-legacy-fields-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-legacy-fields:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout EdgeNode
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned GoReSym
+        uses: actions/checkout@v4
+        with:
+          repository: mandiant/GoReSym
+          ref: 6fba10d77df98335cbd1fb7839043d1ffde8defb
+          path: audit/GoReSym
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Build pinned GoReSym
+        working-directory: audit/GoReSym
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6fba10d77df98335cbd1fb7839043d1ffde8defb"
+          mkdir -p ../tools
+          go build -trimpath -o ../tools/goresym .
+
+      - name: Download and verify trusted 1.3.9 Plus archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit/input audit/extracted audit/output audit/output/functions
+          curl -fL --retry 3 --retry-delay 2 \
+            'https://dl.naixi.net/cdn/goedge/goedgecn/edge-node-linux-amd64-plus-v1.3.9.zip' \
+            -o audit/input/edge-node-linux-amd64-plus-v1.3.9.zip
+          echo 'd6b495249683d981dea15b5bad97acdb  audit/input/edge-node-linux-amd64-plus-v1.3.9.zip' | md5sum -c -
+          unzip -q audit/input/edge-node-linux-amd64-plus-v1.3.9.zip -d audit/extracted
+          BIN="$(find audit/extracted -type f -name edge-node -perm /111 -print -quit)"
+          test -n "${BIN}"
+          echo "8ebac47c212dbb41cc0b2b9c6d4b32e4  ${BIN}" | md5sum -c -
+          echo "${BIN}" > audit/output/binary-path.txt
+
+      - name: Recover HTTPCCConfig functions and type metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(cat audit/output/binary-path.txt)"
+          audit/tools/goresym -d "${BIN}" > audit/functions.json
+          audit/tools/goresym -t -human "${BIN}" > audit/output/types-human.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          data = json.loads(Path('audit/functions.json').read_text())
+          funcs = list(data.get('UserFunctions') or []) + list(data.get('StdFunctions') or [])
+
+          def num(v):
+              return int(v, 0) if isinstance(v, str) else int(v or 0)
+
+          selected = []
+          do_cc = None
+          for fn in funcs:
+              name = fn.get('FullName') or ''
+              start, end = num(fn.get('Start', 0)), num(fn.get('End', 0))
+              if 'HTTPCCConfig' in name:
+                  selected.append((start, end, name))
+              if name.endswith('(*HTTPRequest).doCC'):
+                  do_cc = (start, end, name)
+
+          selected.sort()
+          Path('audit/output/httpccconfig-functions.txt').write_text(
+              ''.join(f'0x{s:x}\t0x{e:x}\t{name}\n' for s, e, name in selected)
+          )
+          if do_cc is None:
+              raise SystemExit('未找到 (*HTTPRequest).doCC')
+          Path('audit/output/doCC-range.txt').write_text(
+              f'0x{do_cc[0]:x}\t0x{do_cc[1]:x}\t{do_cc[2]}\n'
+          )
+
+          binary = Path('audit/output/binary-path.txt').read_text().strip()
+          for start, end, name in selected:
+              if not start or end <= start:
+                  continue
+              safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', name)[-120:]
+              out = Path('audit/output/functions') / f'{start:08x}-{safe}.txt'
+              with out.open('w') as fp:
+                  subprocess.run(
+                      ['objdump', '-d', '-M', 'intel', f'--start-address=0x{start:x}', f'--stop-address=0x{end:x}', binary],
+                      check=True,
+                      stdout=fp,
+                  )
+          PY
+
+          read -r START END NAME < audit/output/doCC-range.txt
+          objdump -d -M intel --start-address="${START}" --stop-address="${END}" "${BIN}" \
+            > audit/output/doCC-objdump.txt
+          rm -f audit/functions.json
+
+      - name: Summarize runtime field reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          asm_path = Path('audit/output/doCC-objdump.txt')
+          lines = asm_path.read_text(errors='replace').splitlines()
+
+          # 可信 1.3.9 amd64 HTTPCCConfig 布局。目标字段旁边保留已知活跃字段作为交叉锚点。
+          fields = {
+              0x08: 'Level',
+              0x18: 'WithRequestPath',
+              0x19: 'UseDefaultThresholds',
+              0x20: 'Thresholds.Data',
+              0x28: 'Thresholds.Len',
+              0x38: 'IgnoreCommonFiles',
+              0x39: 'IgnoreCommonAgents',
+              0x40: 'Action.Data',
+              0x48: 'Action.Len',
+              0x50: 'OnlyURLPatterns.Data',
+              0x68: 'ExceptURLPatterns.Data',
+              0x80: 'EnableFingerprint',
+              0x81: 'EnableGET302',
+              0x88: 'MinQPSPerIP',
+          }
+
+          # doCC 在入口把 web.CC 保存到 [rsp+0x318]。每次从该槽位恢复指针后，
+          # 收集直到该寄存器被明显覆盖前的直接字段访问。
+          load_re = re.compile(r'mov\s+(r(?:ax|bx|cx|dx|si|di|8|9|10|11|12|13|14|15)),QWORD PTR \[rsp\+0x318\]')
+          accesses = []
+          contexts = []
+          for i, line in enumerate(lines):
+              m = load_re.search(line)
+              if not m:
+                  continue
+              reg = m.group(1)
+              for j in range(i + 1, min(i + 18, len(lines))):
+                  cur = lines[j]
+                  for off, name in fields.items():
+                      if f'[{reg}+0x{off:x}]' in cur or (off == 0x08 and f'[{reg}+0x8]' in cur):
+                          accesses.append((off, name, cur.strip()))
+                          contexts.append('\n'.join(lines[max(i, j-2):min(len(lines), j+3)]))
+                  # 对明显把目标寄存器作为目的寄存器的 mov/lea/xor 做保守停止。
+                  if re.search(rf'\b(?:mov|lea|xor)\s+{re.escape(reg)}(?:d|b|w)?\s*,', cur):
+                      break
+
+          # 入口保存前后 r11 仍是同一 CC 指针；补抓 IgnoreCommonFiles 的直接访问作为锚点。
+          for line in lines:
+              if '[r11+0x38]' in line:
+                  accesses.append((0x38, fields[0x38], line.strip()))
+
+          by_off = {}
+          for off, name, line in accesses:
+              by_off.setdefault(off, []).append(line)
+
+          out = []
+          out.append('# doCC 对 HTTPCCConfig 字段的直接访问\n\n')
+          out.append('HTTPCCConfig 指针在原版 doCC 入口保存于 `[rsp+0x318]`。以下只统计从该指针恢复后可直接归属的字段访问。\n\n')
+          for off, name in fields.items():
+              hits = by_off.get(off, [])
+              out.append(f'- `+0x{off:02x}` {name}: {len(hits)} direct hit(s)\n')
+              for hit in hits:
+                  out.append(f'  - `{hit}`\n')
+          Path('audit/output/doCC-field-access-summary.md').write_text(''.join(out))
+          Path('audit/output/doCC-field-access-contexts.txt').write_text('\n\n---\n\n'.join(contexts))
+
+          # 额外在 HTTPCCConfig 自身方法中搜索三个待确认字段偏移；用于判断 Init/New/Default/MatchURL
+          # 是否在进入 doCC 前把 Level/Action/IgnoreCommonAgents 转换成其他运行时配置。
+          method_hits = []
+          for path in sorted(Path('audit/output/functions').glob('*.txt')):
+              text = path.read_text(errors='replace')
+              hits = []
+              for off, name in ((0x08, 'Level'), (0x39, 'IgnoreCommonAgents'), (0x40, 'Action.Data'), (0x48, 'Action.Len')):
+                  patterns = [f'+0x{off:x}]']
+                  if off == 0x08:
+                      patterns.append('+0x8]')
+                  matched = [line.strip() for line in text.splitlines() if any(p in line for p in patterns)]
+                  if matched:
+                      hits.append((off, name, matched))
+              if hits:
+                  method_hits.append(f'## {path.name}\n')
+                  for off, name, matched in hits:
+                      method_hits.append(f'### +0x{off:02x} {name}\n')
+                      method_hits.extend(f'- `{line}`\n' for line in matched)
+          Path('audit/output/httpccconfig-method-target-offsets.md').write_text('\n'.join(method_hits) if method_hits else 'No target-offset hits.\n')
+          PY
+
+          {
+            echo '# GoEdge 1.3.9 Plus CC 兼容字段静态审计'
+            echo
+            echo '- ZIP MD5: d6b495249683d981dea15b5bad97acdb (PASS)'
+            echo '- edge-node MD5: 8ebac47c212dbb41cc0b2b9c6d4b32e4 (PASS)'
+            echo '- 原版 edge-node 未执行。'
+            echo
+            echo '## HTTPCCConfig 相关函数'
+            cat audit/output/httpccconfig-functions.txt
+            echo
+            cat audit/output/doCC-field-access-summary.md
+            echo
+            echo '## HTTPCCConfig 自身方法的目标偏移访问'
+            cat audit/output/httpccconfig-method-target-offsets.md
+          } > audit/output/summary.md
+
+      - name: Upload CC legacy fields audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goedge-139-plus-cc-legacy-fields-audit
+          path: audit/output/
+          if-no-files-found: error
+          retention-days: 7
