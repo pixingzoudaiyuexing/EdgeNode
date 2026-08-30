@@ -1,0 +1,76 @@
+name: Phase A V8Go 0.8.0 Compatibility
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/phase-a-v8go-080-compat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-v8go-080:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Setup Go 1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+
+      - name: Compile original core API shape against upstream v8go v0.8.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/v8go-compat
+          cd /tmp/v8go-compat
+          go mod init edge-v8go-compat
+          go get rogchap.com/v8go@v0.8.0
+
+          cat > core_test.go <<'EOF'
+          package compat
+
+          import v8go "rogchap.com/v8go"
+
+          // 本测试只用于编译/链接，不执行；API 形态来自可信 1.3.9 Plus 静态 ABI。
+          func compileCoreAPI() error {
+              iso := v8go.NewIsolate()
+              defer iso.Dispose()
+
+              tmpl := v8go.NewObjectTemplate(iso)
+              ctx := v8go.NewContext(iso)
+              defer ctx.Close()
+
+              if _, err := tmpl.NewInstance(ctx); err != nil {
+                  return err
+              }
+              if _, err := ctx.RunScript("1+1", "goedge"); err != nil {
+                  return err
+              }
+
+              ft := v8go.NewFunctionTemplate(iso, func(info *v8go.FunctionCallbackInfo) *v8go.Value {
+                  return nil
+              })
+              fn := ft.GetFunction(ctx)
+              if err := ctx.Global().Set("compatFn", fn); err != nil {
+                  return err
+              }
+              return nil
+          }
+          EOF
+
+          # 只编译和链接测试二进制，绝不运行 V8；用于验证 upstream 0.8.0 是否具备原版核心 API/静态库。
+          go test -c -o /tmp/v8go-compat.test .
+          test -s /tmp/v8go-compat.test
+          go version -m /tmp/v8go-compat.test | tee /tmp/v8go-build-info.txt
+          grep -F $'dep\trogchap.com/v8go\tv0.8.0' /tmp/v8go-build-info.txt
+
+      - name: Upload compatibility evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8go-080-compat-evidence
+          path: /tmp/v8go-build-info.txt
+          if-no-files-found: error
+          retention-days: 7
