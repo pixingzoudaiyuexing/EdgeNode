@@ -132,7 +132,7 @@ func TestHTTPRequestBridgeProtocol(t *testing.T) {
 			remotePort:req.remotePort, method:req.method, contentLength:Number(req.contentLength),
 			transferEncoding:req.transferEncoding, proto:req.proto, protoMajor:req.protoMajor,
 			protoMinor:req.protoMinor, cookie:req.cookie("sid"), formatted:req.format(5),
-			server:req.server.id, node:req.node.id, header:req.header["X-Initial"]
+			server:Number(req.server.id), node:Number(req.node.id), header:req.header["X-Initial"]
 		});
 	`, id), "http-request-bridge-test.js")
 	if err != nil {
