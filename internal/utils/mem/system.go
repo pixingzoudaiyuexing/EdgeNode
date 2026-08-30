@@ -1,23 +1,64 @@
-package mem
+package memutils
 
-import gopsutilmem "github.com/shirou/gopsutil/v3/mem"
+import (
+	teaconst "github.com/TeaOSLab/EdgeNode/internal/const"
+	"github.com/TeaOSLab/EdgeNode/internal/utils/goman"
+	gopsutilmem "github.com/shirou/gopsutil/v3/mem"
+	"time"
+)
 
-var systemTotalMemoryGB = -1
+var systemTotalMemory = -1
+var systemMemoryBytes uint64
+var availableMemoryGB int
 
 func init() {
+	if !teaconst.IsMain {
+		return
+	}
+
 	_ = SystemMemoryGB()
+
+	// 与 1.3.9 节点保持一致：后台周期刷新当前可用内存，供运行时策略读取。
+	goman.New(func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for range ticker.C {
+			stat, err := gopsutilmem.VirtualMemory()
+			if err == nil {
+				availableMemoryGB = int(stat.Available >> 30)
+			}
+		}
+	})
 }
 
-// SystemMemoryGB 返回物理内存总量的 GiB 整数部分，并缓存首次成功结果。
-// 该换算方式与 GoEdge 1.3.9 同代实现保持一致。
+// SystemMemoryGB 返回系统总内存的 GiB 整数值。
+// 原版要求该值至少为 1；探测失败时同样回退到 1。
 func SystemMemoryGB() int {
-	if systemTotalMemoryGB > 0 {
-		return systemTotalMemoryGB
+	if systemTotalMemory > 0 {
+		return systemTotalMemory
 	}
+
 	stat, err := gopsutilmem.VirtualMemory()
 	if err != nil {
-		return 0
+		return 1
 	}
-	systemTotalMemoryGB = int(stat.Total / 1024 / 1024 / 1024)
-	return systemTotalMemoryGB
+
+	systemMemoryBytes = stat.Total
+	availableMemoryGB = int(stat.Available >> 30)
+	systemTotalMemory = int(stat.Total >> 30)
+	if systemTotalMemory <= 0 {
+		systemTotalMemory = 1
+	}
+
+	setMaxMemory(systemTotalMemory)
+	return systemTotalMemory
+}
+
+// SystemMemoryBytes 返回最近一次成功探测到的系统总内存字节数。
+func SystemMemoryBytes() uint64 {
+	return systemMemoryBytes
+}
+
+// AvailableMemoryGB 返回最近一次探测到的可用内存 GiB 整数值。
+func AvailableMemoryGB() int {
+	return availableMemoryGB
 }
