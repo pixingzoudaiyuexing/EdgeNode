@@ -35,34 +35,20 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, struct
+          import hashlib
           from pathlib import Path
 
           path=Path('audit/output/binary-path.txt').read_text().strip()
           data=Path(path).read_bytes()
-          if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
-              raise SystemExit('unexpected ELF')
-          e_phoff=struct.unpack_from('<Q',data,32)[0]
-          e_phentsize=struct.unpack_from('<H',data,54)[0]
-          e_phnum=struct.unpack_from('<H',data,56)[0]
-          loads=[]
-          for i in range(e_phnum):
-              o=e_phoff+i*e_phentsize
-              typ,flags=struct.unpack_from('<II',data,o)
-              if typ != 1: continue
-              po,pv,pp,pfs,pms,pa=struct.unpack_from('<QQQQQQ',data,o+8)
-              loads.append((pv,pv+pfs,po))
-          def file_off(addr):
-              for lo,hi,off in loads:
-                  if lo <= addr < hi:
-                      return off+(addr-lo), hi-addr
-              raise SystemExit(f'address 0x{addr:x} not file-backed')
-          def cstr(addr,limit=4096):
-              off,avail=file_off(addr)
-              end=min(len(data),off+min(limit,avail))
+
+          # 这些地址来自 `strings -a -t x`，因此是文件偏移，不是 ELF 虚拟地址。
+          def cstr(off,limit=4096):
+              if off < 0 or off >= len(data):
+                  raise SystemExit(f'offset 0x{off:x} outside file')
+              end=min(len(data),off+limit)
               nul=data.find(b'\x00',off,end)
               if nul < 0:
-                  raise SystemExit(f'no NUL for 0x{addr:x}')
+                  raise SystemExit(f'no NUL for file offset 0x{off:x}')
               return data[off:nul]
 
           funcs={
@@ -71,9 +57,17 @@ jobs:
               'once':0x2d2b547,
               'runOnce':0x2d2b5a2,
           }
+          expected_prefixes={
+              'prepareNamespace':b'gojs.prepareNamespace = function (ns) {',
+              'copyAttrs':b'gojs.copyAttrs = function (destObj, srcObj) {',
+              'once':b'\tgojs.once = function (f) {',
+              'runOnce':b'\tgojs.runOnce = function () {',
+          }
           summary=[]
-          for name,addr in funcs.items():
-              raw=cstr(addr)
+          for name,off in funcs.items():
+              raw=cstr(off)
+              if not raw.startswith(expected_prefixes[name]):
+                  raise SystemExit(f'{name}: unexpected prefix at file offset 0x{off:x}')
               text=raw.decode('utf-8')
               Path(f'audit/output/{name}.js.txt').write_text(text+'\n')
               summary.append(f'{name}\tlen={len(raw)}\tsha256={hashlib.sha256(raw).hexdigest()}\n')
